@@ -200,11 +200,12 @@ export function createDevTests(config?: DevTestConfig) {
     const countLogMessage = (log: string, message: string) =>
       log.split(message).length - 1;
     type ExpectedHmrLogCount = number | { min?: number; max?: number };
-    const expectLogCount = (
-      actual: number,
-      expected: ExpectedHmrLogCount | undefined
-    ) => {
+    const expectLogCount = (actual: number, expected: ExpectedHmrLogCount) => {
       if (typeof expected === 'number') {
+        if (expected === 0) {
+          expect(actual).toBe(0);
+          return;
+        }
         // Canary webpack can emit duplicate watcher events for one edit; keep
         // stable exact while treating canary counts as lower bounds.
         if (finalConfig.canary) {
@@ -214,17 +215,17 @@ export function createDevTests(config?: DevTestConfig) {
         expect(actual).toBe(expected);
         return;
       }
-      expect(actual).toBeGreaterThanOrEqual(expected?.min ?? 0);
-      if (expected?.max !== undefined) {
+      expect(actual).toBeGreaterThanOrEqual(expected.min ?? 0);
+      if (expected.max !== undefined) {
         expect(actual).toBeLessThanOrEqual(expected.max);
       }
     };
     const expectHmrLogCounts = async (
       cursor: number | undefined,
       expected: {
-        skip?: ExpectedHmrLogCount;
-        hot?: ExpectedHmrLogCount;
-        full?: ExpectedHmrLogCount;
+        skip: ExpectedHmrLogCount;
+        hot: ExpectedHmrLogCount;
+        full: ExpectedHmrLogCount;
       }
     ) => {
       if (cursor === undefined) {
@@ -377,7 +378,7 @@ export function createDevTests(config?: DevTestConfig) {
         );
 
         await expectGeneratedArtifactsUnchanged(snapshot);
-        await expectHmrLogCounts(logCursor, { skip: 1 });
+        await expectHmrLogCounts(logCursor, { skip: 1, hot: 0, full: 0 });
       }
     );
 
@@ -414,7 +415,11 @@ export async function hmrPageWorkflow() {
             );
           },
         });
-        await expectHmrLogCounts(logCursor, { full: 1, skip: { max: 1 } });
+        await expectHmrLogCounts(logCursor, {
+          skip: { max: 1 },
+          hot: 0,
+          full: 1,
+        });
       }
     );
 
@@ -1062,7 +1067,7 @@ ${apiFileContent}`
           {
             file: files.step,
             kind: 'none',
-            expectedLogCounts: { skip: 1 },
+            expectedLogCounts: { skip: 1, hot: 0, full: 0 },
             expectedStepValue: (iteration: number) => `step-only-${iteration}`,
             source: (
               iteration: number
@@ -1078,7 +1083,7 @@ export async function hmrFuzzStep() {
           {
             file: files.stepHelper,
             kind: 'none',
-            expectedLogCounts: { skip: 1 },
+            expectedLogCounts: { skip: 1, hot: 0, full: 0 },
             expectedStepValue: (iteration: number) =>
               `step-helper-only-${iteration}`,
             source: (
@@ -1091,7 +1096,7 @@ export async function hmrFuzzStep() {
           {
             file: files.workflow,
             kind: 'workflow',
-            expectedLogCounts: { hot: 1 },
+            expectedLogCounts: { skip: 0, hot: 1, full: 0 },
             expectedWorkflowValue: (iteration: number) =>
               `workflow-body-${iteration}`,
             source: (
@@ -1114,7 +1119,7 @@ export async function hmrFuzzWorkflow() {
           {
             file: files.workflowHelper,
             kind: 'workflow',
-            expectedLogCounts: { hot: 1 },
+            expectedLogCounts: { skip: 0, hot: 1, full: 0 },
             expectedWorkflowValue: (iteration: number) =>
               `workflow-helper-body-${iteration}`,
             source: (
@@ -1129,7 +1134,7 @@ export function hmrFuzzWorkflowHelper(value: HmrFuzzBox) {
           {
             file: files.sharedHelper,
             kind: 'workflow',
-            expectedLogCounts: { hot: 1 },
+            expectedLogCounts: { skip: 0, hot: 1, full: 0 },
             expectedStepValue: (iteration: number) =>
               `shared-body-${iteration}`,
             expectedWorkflowValue: (iteration: number) =>
@@ -1144,7 +1149,7 @@ export function hmrFuzzWorkflowHelper(value: HmrFuzzBox) {
           {
             file: files.serde,
             kind: 'serde',
-            expectedLogCounts: { hot: 1 },
+            expectedLogCounts: { skip: 0, hot: 1, full: 0 },
             source: (iteration: number) => `export class HmrFuzzBox {
   static classId = 'HmrFuzzBox';
 
@@ -1353,7 +1358,7 @@ ${apiFileContent}`
           },
           {
             description: 'workflow file removed from API import',
-            expectedLogCounts: { full: 1 },
+            expectedLogCounts: { skip: 0, hot: 0, full: 1 },
             write: async () => {
               await fs.rm(files.addedWorkflow, { force: true });
               await fs.writeFile(
@@ -1388,7 +1393,7 @@ ${apiFileContent}`
             logCursor,
             'expectedLogCounts' in fullCase
               ? fullCase.expectedLogCounts
-              : { full: 1 }
+              : { skip: 0, hot: 0, full: 1 }
           );
           snapshot = await waitForGeneratedArtifactStability();
         }
@@ -1396,12 +1401,20 @@ ${apiFileContent}`
         const unrelatedLogCursor = await readDevServerLogCursor();
         await fs.writeFile(files.unrelated, 'export const unrelated = true;\n');
         snapshot = await expectGeneratedArtifactsUnchanged(snapshot);
-        await expectHmrLogCounts(unrelatedLogCursor, {});
+        await expectHmrLogCounts(unrelatedLogCursor, {
+          skip: 0,
+          hot: 0,
+          full: 0,
+        });
 
         const unrelatedRemovalLogCursor = await readDevServerLogCursor();
         await fs.unlink(files.unrelated);
         snapshot = await expectGeneratedArtifactsUnchanged(snapshot);
-        await expectHmrLogCounts(unrelatedRemovalLogCursor, {});
+        await expectHmrLogCounts(unrelatedRemovalLogCursor, {
+          skip: 0,
+          hot: 0,
+          full: 0,
+        });
       }
     );
   });
