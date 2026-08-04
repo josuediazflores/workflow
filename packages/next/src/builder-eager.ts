@@ -151,7 +151,7 @@ export async function getNextBuilderEager(
             ? pathname
             : resolve(this.config.workingDir, pathname)
           ).replace(/\\/g, '/');
-        const sourceSnapshots = new Map<string, SourceSnapshot>();
+        let sourceSnapshots = new Map<string, SourceSnapshot>();
 
         const watchableExtensions = new Set([
           '.js',
@@ -201,14 +201,17 @@ export async function getNextBuilderEager(
         const readSourceSnapshot = (file: string) =>
           createSourceSnapshot({ file, detectWorkflowPatterns });
 
-        const refreshSourceSnapshots = () =>
-          replaceSourceSnapshots({
+        const readSourceSnapshots = async () => {
+          const snapshots = new Map<string, SourceSnapshot>();
+          await replaceSourceSnapshots({
             discoveredEntries,
             inputFiles: options.inputFiles,
             normalizePath,
             readSnapshot: readSourceSnapshot,
-            sourceSnapshots,
+            sourceSnapshots: snapshots,
           });
+          return snapshots;
+        };
 
         const mergeCombinedManifest = (
           nextStepsManifest: WorkflowManifest
@@ -255,6 +258,10 @@ export async function getNextBuilderEager(
           const newInputFiles = await this.getInputFiles();
           options.inputFiles = newInputFiles;
 
+          // Snapshot before building so edits made during the build remain
+          // dirty and trigger the file event already queued behind this task.
+          const nextSourceSnapshots = await readSourceSnapshots();
+
           await stepsCtx?.dispose();
           await workflowsCtx.interimBundleCtx.dispose();
 
@@ -275,7 +282,7 @@ export async function getNextBuilderEager(
           };
 
           await writeManifest(newCombined.manifest);
-          await refreshSourceSnapshots();
+          sourceSnapshots = nextSourceSnapshots;
         };
 
         const isWatchableFile = (path: string) =>
@@ -410,7 +417,7 @@ export async function getNextBuilderEager(
           }
         };
 
-        await refreshSourceSnapshots();
+        sourceSnapshots = await readSourceSnapshots();
         let {
           files: knownFiles,
           aliases: knownFileAliases,
@@ -438,9 +445,12 @@ export async function getNextBuilderEager(
             readSnapshot: readSourceSnapshot,
             sourceSnapshots,
           });
+          if (decision.kind === 'ignored') {
+            return;
+          }
           if (decision.kind === 'none') {
             logDevHmr('workflow dev hmr: skip');
-            for (const [file, snapshot] of decision.snapshots || []) {
+            for (const [file, snapshot] of decision.snapshots) {
               sourceSnapshots.set(file, snapshot);
             }
             return;
