@@ -282,6 +282,19 @@ export async function getNextBuilderEager(
           };
 
           await writeManifest(newCombined.manifest);
+          await Promise.all(
+            [
+              ...getRelevantFiles({
+                discoveredEntries,
+                inputFiles: options.inputFiles,
+                normalizePath,
+              }),
+            ].map(async (file) => {
+              if (!nextSourceSnapshots.has(file)) {
+                nextSourceSnapshots.set(file, await readSourceSnapshot(file));
+              }
+            })
+          );
           sourceSnapshots = nextSourceSnapshots;
         };
 
@@ -446,6 +459,7 @@ export async function getNextBuilderEager(
             sourceSnapshots,
           });
           if (decision.kind === 'ignored') {
+            logDevHmr('workflow dev hmr: ignored');
             return;
           }
           if (decision.kind === 'none') {

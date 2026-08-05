@@ -610,7 +610,9 @@ export const classifyRebuild = async ({
       return { kind: 'full' };
     }
     if (snapshots.size === 0) {
-      return { kind: 'ignored' };
+      return prunedAddedFiles.snapshots.size > 0
+        ? { kind: 'none', snapshots: prunedAddedFiles.snapshots }
+        : { kind: 'ignored' };
     }
     return workflowEntryFilesChanged({
       changedFiles: changedRelevantFiles,

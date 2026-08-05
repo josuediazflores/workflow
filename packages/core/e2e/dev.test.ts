@@ -151,6 +151,7 @@ export function createDevTests(config?: DevTestConfig) {
     const devServerLogPath = process.env.DEV_SERVER_LOG_PATH;
     const shouldAssertDevHmrLogs = process.env.WORKFLOW_DEV_HMR_LOGS === '1';
     const hmrLogMessages = {
+      ignored: 'workflow dev hmr: ignored',
       skip: 'workflow dev hmr: skip',
       hot: 'workflow dev hmr: hot rebuild',
       full: 'workflow dev hmr: full rediscovery',
@@ -223,6 +224,7 @@ export function createDevTests(config?: DevTestConfig) {
     const expectHmrLogCounts = async (
       cursor: number | undefined,
       expected: {
+        ignored?: ExpectedHmrLogCount;
         skip: ExpectedHmrLogCount;
         hot: ExpectedHmrLogCount;
         full: ExpectedHmrLogCount;
@@ -237,6 +239,12 @@ export function createDevTests(config?: DevTestConfig) {
         intervalMs: 250,
         check: async () => {
           const log = (await readDevServerLog()).slice(cursor);
+          if (expected.ignored !== undefined) {
+            expectLogCount(
+              countLogMessage(log, hmrLogMessages.ignored),
+              expected.ignored
+            );
+          }
           expectLogCount(
             countLogMessage(log, hmrLogMessages.skip),
             expected.skip
@@ -1214,7 +1222,7 @@ export function hmrFuzzWorkflowHelper(value: HmrFuzzBox) {
           await expectHmrLogCounts(logCursor, testCase.expectedLogCounts);
         }
 
-        const fullCases = [
+        const rebuildCases = [
           {
             description: 'workflow import graph change',
             write: async () => {
@@ -1245,6 +1253,26 @@ export async function hmrFuzzWorkflow() {
                 description:
                   'workflow import graph full rediscovery to affect execution',
                 workflowValue: 'imported-stable',
+              });
+            },
+          },
+          {
+            description: 'new workflow dependency body change',
+            expectedLogCounts: { skip: 0, hot: 1, full: 0 },
+            write: async () => {
+              await fs.writeFile(
+                files.importHelper,
+                "export const hmrFuzzImportedValue = 'imported-updated';\n"
+              );
+            },
+            assert: async () => {
+              if (finalConfig.canary) {
+                return;
+              }
+              await expectWorkflowResult({
+                description:
+                  'new workflow dependency body change to affect execution',
+                workflowValue: 'imported-updated',
               });
             },
           },
@@ -1384,15 +1412,15 @@ ${apiFileContent}`
           },
         ] as const;
 
-        for (let index = 0; index < fullCases.length; index++) {
-          const fullCase = fullCases[index];
+        for (let index = 0; index < rebuildCases.length; index++) {
+          const rebuildCase = rebuildCases[index];
           const logCursor = await readDevServerLogCursor();
-          await fullCase.write(index + 1);
-          await fullCase.assert(index + 1);
+          await rebuildCase.write(index + 1);
+          await rebuildCase.assert(index + 1);
           await expectHmrLogCounts(
             logCursor,
-            'expectedLogCounts' in fullCase
-              ? fullCase.expectedLogCounts
+            'expectedLogCounts' in rebuildCase
+              ? rebuildCase.expectedLogCounts
               : { skip: 0, hot: 0, full: 1 }
           );
           snapshot = await waitForGeneratedArtifactStability();
@@ -1402,6 +1430,7 @@ ${apiFileContent}`
         await fs.writeFile(files.unrelated, 'export const unrelated = true;\n');
         snapshot = await expectGeneratedArtifactsUnchanged(snapshot);
         await expectHmrLogCounts(unrelatedLogCursor, {
+          ignored: 1,
           skip: 0,
           hot: 0,
           full: 0,
@@ -1411,6 +1440,7 @@ ${apiFileContent}`
         await fs.unlink(files.unrelated);
         snapshot = await expectGeneratedArtifactsUnchanged(snapshot);
         await expectHmrLogCounts(unrelatedRemovalLogCursor, {
+          ignored: 1,
           skip: 0,
           hot: 0,
           full: 0,
