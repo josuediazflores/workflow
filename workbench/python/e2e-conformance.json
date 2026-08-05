@@ -9,5 +9,15 @@
     "fails the run rather than quietly skipping."
   ],
   "language": "python",
-  "fixtures": ["nullByteWorkflow", "promiseAllWorkflow"]
+  "fixtures": [
+    "addTenWorkflow",
+    "nullByteWorkflow",
+    "parallelSleepWorkflow",
+    "promiseAllWorkflow",
+    "sleepInLoopWorkflow",
+    "sleepingWorkflow"
+  ],
+  "unsupported": {
+    "resilient start: addTenWorkflow completes when run_created returns 500": "vercel-py's workflow handler reads the run row before replaying (runtime.py:529 `world.runs_get`) and 500s when it is absent. The TypeScript runtime instead bootstraps the run from `run_started` using the input carried in the queue message, which is what makes a run survive a failed `run_created`."
+  }
 }

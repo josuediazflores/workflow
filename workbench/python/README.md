@@ -36,15 +36,31 @@ Which fixtures the suite will run is declared in `e2e-conformance.json`. Anythin
 not listed there is skipped; anything listed that the app stops registering fails
 the run rather than quietly skipping. Add a name only once its test passes.
 
+That file has a second axis, `unsupported`, keyed by test name rather than
+fixture name. It exists because "did you port this workflow" and "does your
+runtime implement this protocol behaviour" are different questions, and one test
+answers the second one about a fixture that *is* ported — see the entry there.
+It ratchets in the direction that can rot: a name listed under `unsupported`
+that matches no test in the suite is a hard failure, so a renamed test cannot
+leave a stale exemption behind.
+
+Current baseline: **8 passing, 129 skipped, of 137.**
+
 ## What is missing
 
 This app is honest about being early. In rough order of how much it costs:
 
-- **Positional run input is unsupported.** vercel-py enforces keyword-only
-  parameters at decoration time, and `keyword_arguments()` raises
-  `SerializationError` on a positional array. Every fixture whose test starts it
-  with something like `[123]` is unportable until that changes — which is most of
-  them, and the main reason `e2e-conformance.json` is two names long.
+- **Most fixtures are simply not ported yet** — 66 tests across 52 fixtures.
+  They are not blocked on one thing anymore: the largest blocks are hooks (19
+  tests, where vercel-py's `BaseHook.wait()` has a different shape than the
+  async-iterable hook the fixtures use), streams (11), `setAttributes` (9, no
+  Python equivalent), and `FatalError` / `RetryableError` (7, not exported by
+  `vercel.workflow.errors`).
+- **A run whose `run_created` write failed never starts.** vercel-py's workflow
+  handler reads the run row before replaying (`runtime.py:529`) and 500s when it
+  is absent, where the TypeScript runtime bootstraps from `run_started` using the
+  input carried in the queue message. This is the one test that fails rather than
+  skips, so it is recorded under `unsupported`.
 - **The `.well-known/workflow/v1` surface lives in `app.py`, not the SDK.**
   Deployed Python is driven by platform queue triggers on
   `/_py_workflows/<name>`, so vercel-py ships no manifest generator, no `/flow`
@@ -53,13 +69,6 @@ This app is honest about being early. In rough order of how much it costs:
   exactly the headers `@workflow/world-local` sends — so the adapter is routing
   plus a manifest, and it belongs here because it implements a contract the SDK
   does not claim to serve.
-- **`compat.py` patches the SDK at runtime.** vercel-py declares
-  `BaseEvent.spec_version` as `Literal[1, 2]` and never widened it as the
-  TypeScript spec version moved 3 → 4 → 5. Since `@workflow/world-local` writes
-  the current version, every read of a TS-written log fails validation before the
-  runtime sees an event. The field is validation-only — nothing reads it to decide
-  how to decode — so the shim widens it to `int`. **A green run currently depends
-  on this patch**; it should be deleted once vercel-py widens the field.
 - **Imports reach into `vercel._internal`.** `workflow_entrypoint`,
   `step_entrypoint`, and the `HTTPRequest` base are all private. There is no
   public equivalent.

@@ -157,6 +157,21 @@ export interface ConformanceConfig {
    * turn into a skip, and a green run would stop meaning anything.
    */
   fixtures: string[];
+  /**
+   * Tests to skip even though their fixture is listed, mapping the test's exact
+   * name to why. The second axis exists because `fixtures` answers "did you port
+   * this workflow", and some tests fail on a different question: whether the
+   * app's *runtime* implements a protocol behavior the fixture happens to
+   * exercise. `addTenWorkflow` is the case that forced it — the fixture is
+   * ported and its own test passes, but a separate test drives the same fixture
+   * through a simulated `run_created` outage and expects the runtime to bootstrap
+   * the run from `run_started`.
+   *
+   * Ratcheted the same way as `fixtures`, in the direction that can rot: a name
+   * here that matches no test in the suite is a **hard failure**, so a renamed
+   * test cannot leave a stale exemption behind that silently covers nothing.
+   */
+  unsupported?: Record<string, string>;
 }
 
 export const CONFORMANCE_CONFIG_FILENAME = 'e2e-conformance.json';
@@ -194,14 +209,26 @@ export function getConformanceConfig(): ConformanceConfig | null {
     );
   }
 
-  const { language, fixtures } = (parsed ?? {}) as Partial<ConformanceConfig>;
+  const { language, fixtures, unsupported } = (parsed ??
+    {}) as Partial<ConformanceConfig>;
   if (typeof language !== 'string' || !Array.isArray(fixtures)) {
     throw new Error(
       `${configPath} must be an object with a string "language" and a "fixtures" array`
     );
   }
+  if (
+    unsupported !== undefined &&
+    (typeof unsupported !== 'object' ||
+      unsupported === null ||
+      Array.isArray(unsupported) ||
+      Object.values(unsupported).some((v) => typeof v !== 'string'))
+  ) {
+    throw new Error(
+      `${configPath}: "unsupported" must be an object mapping a test name to the reason it is skipped`
+    );
+  }
 
-  conformanceConfigCache = { language, fixtures };
+  conformanceConfigCache = { language, fixtures, unsupported };
   return conformanceConfigCache;
 }
 
@@ -246,6 +273,47 @@ export function requireFixture(fixtureName: string): void {
   if (hasFixture(fixtureName)) return;
   getCurrentTest()?.context.skip(
     `"${fixtureName}" is not listed in ${CONFORMANCE_CONFIG_FILENAME}`
+  );
+}
+
+// Names matched against `unsupported` so far, so `assertUnsupportedTestsExist`
+// can tell a live exemption from one whose test was renamed away.
+const seenTestNames = new Set<string>();
+
+/**
+ * Skips the running test when the app declares it unsupported.
+ *
+ * Called from `setupRunTracking`, which every test in the suite already runs
+ * through, so this needs no per-test annotation either. Unlike a missing
+ * fixture, the reason is the app's own words — the config carries it.
+ *
+ * No-op for an app with no conformance declaration.
+ */
+export function requireSupported(testName: string): void {
+  seenTestNames.add(testName);
+  const reason = getConformanceConfig()?.unsupported?.[testName];
+  if (!reason) return;
+  getCurrentTest()?.context.skip(
+    `${CONFORMANCE_CONFIG_FILENAME} declares this unsupported: ${reason}`
+  );
+}
+
+/**
+ * Fails when the app exempts a test name the suite never ran.
+ *
+ * The mirror of `getWorkflowMetadata`'s "declared but not in the manifest"
+ * failure, for the other axis: an exemption is a claim about a specific test,
+ * and a rename must break it loudly rather than leave it silently covering
+ * nothing. Call from `afterAll` — it needs the whole file to have run.
+ */
+export function assertUnsupportedTestsExist(): void {
+  const unsupported = getConformanceConfig()?.unsupported;
+  if (!unsupported) return;
+  const stale = Object.keys(unsupported).filter((n) => !seenTestNames.has(n));
+  if (stale.length === 0) return;
+  throw new Error(
+    `${CONFORMANCE_CONFIG_FILENAME} lists "unsupported" tests that do not exist ` +
+      `in this suite (renamed or removed?): ${stale.map((n) => `"${n}"`).join(', ')}`
   );
 }
 
@@ -894,6 +962,11 @@ function emitGitHubAnnotation(
 export function setupRunTracking(testName: string) {
   currentTestName = testName;
   trackedRuns = [];
+
+  // Second conformance gate. Sited here because every test in the suite calls
+  // setupRunTracking from `beforeEach`, which makes this the one place that
+  // sees a test's name without the test having to declare anything.
+  requireSupported(testName);
 
   // Heartbeat: announce the test the moment it starts, written straight to
   // stdout to bypass vitest's per-file console buffering. Without this, a

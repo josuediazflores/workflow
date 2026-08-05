@@ -27,12 +27,6 @@ import httpx
 from vercel._internal.workflow import world as w
 from vercel._internal.workflow.runtime import step_entrypoint, workflow_entrypoint
 
-import compat
-
-# Patch the SDK's event model before anything reads the log. See `compat.py` —
-# without this the app 500s on every replay of a TS-written run.
-compat.apply()
-
 # The fixture module is named to match `workbench/example/workflows/99_e2e.ts`,
 # which a plain `import` statement cannot express — a module name may not start
 # with a digit. importlib has no such restriction.

@@ -32,6 +32,7 @@ import {
   resumeHook,
 } from '../src/runtime';
 import {
+  assertUnsupportedTestsExist,
   cliCancel,
   cliHealthJson,
   cliInspectJson,
@@ -337,6 +338,8 @@ describe('e2e', () => {
   afterAll(() => {
     writeE2EMetadata();
     writeDiagnosticsSidecar();
+    // Last, so a stale exemption is reported without costing the diagnostics.
+    assertUnsupportedTestsExist();
   });
 
   // JS-only: asserts the JS workflow-ID scheme (`workflow//./{path}//{fn}`) and

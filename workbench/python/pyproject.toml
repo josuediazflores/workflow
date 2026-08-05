@@ -18,4 +18,4 @@ dependencies = [
 # sibling packages it depends on (vercel-queue, vercel-internal-core, ...)
 # resolve from PyPI.
 [tool.uv.sources]
-vercel = { git = "https://github.com/vercel/vercel-py", rev = "d550e0725098e901aae19510217e5e934c839958", subdirectory = "src/vercel" }
+vercel = { git = "https://github.com/vercel/vercel-py", rev = "b4dea16d83ba554e116f71125bda98156644344d", subdirectory = "src/vercel" }
