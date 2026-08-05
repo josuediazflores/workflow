@@ -291,7 +291,11 @@ export async function getNextBuilderEager(
               }),
             ].map(async (file) => {
               if (!nextSourceSnapshots.has(file)) {
-                nextSourceSnapshots.set(file, await readSourceSnapshot(file));
+                try {
+                  nextSourceSnapshots.set(file, await readSourceSnapshot(file));
+                } catch {
+                  nextSourceSnapshots.delete(file);
+                }
               }
             })
           );
