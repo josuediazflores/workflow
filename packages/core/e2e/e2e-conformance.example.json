@@ -1,0 +1,24 @@
+{
+  "$comment": [
+    "Reference for `e2e-conformance.json`. Copy this into a workbench app's",
+    "directory to run the e2e suite against an app that is not written in",
+    "JavaScript. See `ConformanceConfig` in ./utils.ts.",
+    "",
+    "\"language\": anything other than \"javascript\" skips the tests marked",
+    "`testJsOnly` / `describeJsOnly` in e2e.test.ts — the ones whose subject is",
+    "the JS implementation rather than the workflow protocol.",
+    "",
+    "\"fixtures\": the workflows/99_e2e fixtures this app implements. A test whose",
+    "fixture is not listed is skipped; a fixture that is listed but missing from",
+    "the deployed manifest fails the run, so the list cannot silently rot.",
+    "Grow it as fixtures are ported; never shrink it without saying why."
+  ],
+  "language": "python",
+  "fixtures": [
+    "addTenWorkflow",
+    "sleepingWorkflow",
+    "promiseAllWorkflow",
+    "nullByteWorkflow",
+    "hookWorkflow"
+  ]
+}

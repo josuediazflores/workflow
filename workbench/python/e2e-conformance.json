@@ -1,0 +1,13 @@
+{
+  "$comment": [
+    "Which `workflows/99_e2e` fixtures this app implements. See",
+    "`packages/core/e2e/e2e-conformance.example.json` for the format and",
+    "`ConformanceConfig` in `packages/core/e2e/utils.ts` for the gate.",
+    "",
+    "Grow this list as fixtures are ported to `workflows/99_e2e.py`; never",
+    "shrink it without saying why. A name here that the app stops registering",
+    "fails the run rather than quietly skipping."
+  ],
+  "language": "python",
+  "fixtures": ["nullByteWorkflow", "promiseAllWorkflow"]
+}

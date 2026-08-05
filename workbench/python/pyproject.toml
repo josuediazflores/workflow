@@ -1,0 +1,21 @@
+[project]
+name = "workflow-example-python"
+version = "0.0.0"
+description = "Python conformance target for the @workflow/core e2e suite"
+requires-python = ">=3.10"
+dependencies = [
+  "vercel",
+  # vercel-py carries uvicorn as a dev-only dependency, so declare it here.
+  "uvicorn>=0.30",
+]
+
+# Pinned to a vercel-py commit rather than a release: this app tracks the
+# Python SDK's `main` so the conformance suite reports on what is actually
+# being built. Bump `rev` deliberately, and re-run the suite when you do.
+#
+# `subdirectory` is required — the vercel-py repo root is a uv workspace whose
+# build backend raises, so only `src/vercel` is installable on its own. The
+# sibling packages it depends on (vercel-queue, vercel-internal-core, ...)
+# resolve from PyPI.
+[tool.uv.sources]
+vercel = { git = "https://github.com/vercel/vercel-py", rev = "d550e0725098e901aae19510217e5e934c839958", subdirectory = "src/vercel" }
