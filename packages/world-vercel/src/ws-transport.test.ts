@@ -34,6 +34,7 @@ import {
   resolveWsTransport,
   toEventsWsUrl,
 } from './ws-transport.js';
+import { isWsStreamsTransportEnabled } from './ws-transport-enabled.js';
 
 type Listener = (...args: unknown[]) => void;
 
@@ -263,6 +264,82 @@ describe('request/reply', () => {
 
     await expect(second).resolves.toMatchObject({ meta: { reqId: 2 } });
     await expect(first).resolves.toMatchObject({ meta: { reqId: 1 } });
+  });
+});
+
+describe('subscriptions', () => {
+  it('routes many frames to a subscription without disturbing one-shot requests', async () => {
+    const transport = getWsEventsTransport(WS_URL, headers);
+    const frames: string[] = [];
+    const subscriptionPromise = transport.subscribe(
+      (reqId) =>
+        encodeFrame(
+          {
+            reqId,
+            type: 'stream_read',
+            stream: { name: 'output', startIndex: 0 },
+          },
+          EMPTY
+        ),
+      (frame) => {
+        frames.push(String(frame.meta.type));
+        return frame.meta.type === 'stream_end';
+      },
+      () => {}
+    );
+    const socket = await nextSocket();
+    socket.open();
+    const subscription = await subscriptionPromise;
+
+    const event = transport.request(eventFrame);
+    await tick();
+    expect(sentReqIds(socket)).toEqual([1, 2]);
+
+    socket.deliver(
+      encodeFrame(
+        { reqId: subscription.reqId, type: 'stream_chunk', index: 0 },
+        new Uint8Array([1])
+      )
+    );
+    socket.deliver(ackFrame(2));
+    socket.deliver(
+      encodeFrame(
+        {
+          reqId: subscription.reqId,
+          type: 'stream_end',
+          reason: 'complete',
+          nextIndex: 1,
+        },
+        EMPTY
+      )
+    );
+    await tick();
+
+    expect(frames).toEqual(['stream_chunk', 'stream_end']);
+    await expect(event).resolves.toMatchObject({ meta: { reqId: 2 } });
+  });
+
+  it('fails subscriptions when their socket closes', async () => {
+    const transport = getWsEventsTransport(WS_URL, headers);
+    const onError = vi.fn();
+    const subscriptionPromise = transport.subscribe(
+      (reqId) =>
+        encodeFrame(
+          { reqId, type: 'stream_read', stream: { name: 'output' } },
+          EMPTY
+        ),
+      () => false,
+      onError
+    );
+    const socket = await nextSocket();
+    socket.open();
+    await subscriptionPromise;
+
+    socket.close(1006);
+    await tick();
+    expect(onError).toHaveBeenCalledWith(
+      expect.objectContaining({ name: 'WsTransportError' })
+    );
   });
 });
 
@@ -947,6 +1024,7 @@ describe('drain reason', () => {
 describe('transport selection', () => {
   afterEach(() => {
     delete process.env.WORKFLOW_EVENTS_TRANSPORT;
+    delete process.env.WORKFLOW_STREAMS_TRANSPORT;
   });
 
   /** A World that routes through the api-workflow proxy. */
@@ -977,6 +1055,15 @@ describe('transport selection', () => {
 
     it('defaults to HTTP when unset', () => {
       expect(isWsEventsTransportEnabled()).toBe(false);
+    });
+  });
+
+  describe('isWsStreamsTransportEnabled', () => {
+    it('is independent from the events gate and defaults to HTTP', () => {
+      process.env.WORKFLOW_EVENTS_TRANSPORT = 'ws';
+      expect(isWsStreamsTransportEnabled()).toBe(false);
+      process.env.WORKFLOW_STREAMS_TRANSPORT = 'ws';
+      expect(isWsStreamsTransportEnabled()).toBe(true);
     });
   });
 

@@ -44,15 +44,31 @@ export interface WsFrameReply {
  * `postEventFrameOverWs` maps it to `code: 'TRANSPORT'`.
  */
 export class WsTransportError extends Error {
-  constructor(message: string, opts?: { cause?: unknown }) {
+  readonly delivery: 'not_sent' | 'unknown';
+
+  constructor(
+    message: string,
+    opts?: { cause?: unknown; delivery?: 'not_sent' | 'unknown' }
+  ) {
     super(message, { cause: opts?.cause });
     this.name = 'WsTransportError';
+    this.delivery = opts?.delivery ?? 'unknown';
   }
 }
 
 interface PendingRequest {
   resolve: (reply: WsFrameReply) => void;
   reject: (err: unknown) => void;
+}
+
+export interface WsSubscription {
+  reqId: number;
+  unsubscribe(): void;
+}
+
+interface Subscription {
+  onFrame: (frame: WsFrameReply) => boolean;
+  onError: (err: unknown) => void;
 }
 
 /**
@@ -65,6 +81,8 @@ interface Connection {
   ws: WebSocket;
   nextReqId: number;
   pending: Map<number, PendingRequest>;
+  subscriptions: Map<number, Subscription>;
+  incoming: Promise<void>;
 }
 
 /** Reserved reqId the server replies under when a frame was too malformed to
@@ -122,7 +140,7 @@ function describeError(err: unknown): string {
  * One multiplexed connection to the events WS endpoint. Not exported — callers
  * go through `getWsEventsTransport`, which caches one instance per `wsUrl`.
  */
-class WsEventsTransport {
+export class WsTransport {
   private connection: Connection | null = null;
   private connecting: Promise<Connection> | null = null;
   private reconnectAttempts = 0;
@@ -205,7 +223,7 @@ class WsEventsTransport {
             reject(
               new WsTransportError(
                 `workflow-server events WS send failed: ${describeError(err)}`,
-                { cause: err }
+                { cause: err, delivery: 'not_sent' }
               )
             );
           }
@@ -214,6 +232,42 @@ class WsEventsTransport {
     } finally {
       if (deadline !== undefined) clearTimeout(deadline);
     }
+  }
+
+  /** Register a multi-reply request. Returning `true` from `onFrame` marks the
+   * subscription complete; one-shot requests continue to use `pending`. */
+  async subscribe(
+    buildFrame: (reqId: number) => Uint8Array,
+    onFrame: (frame: WsFrameReply) => boolean,
+    onError: (err: unknown) => void
+  ): Promise<WsSubscription> {
+    if (this.closed) {
+      throw new WsTransportError(
+        `workflow-server events WS channel for ${this.wsUrl} is closed`
+      );
+    }
+    const conn = await this.ensureConnected();
+    const reqId = conn.nextReqId++;
+    conn.subscriptions.set(reqId, { onFrame, onError });
+    try {
+      await new Promise<void>((resolve, reject) => {
+        conn.ws.send(buildFrame(reqId), (err) => {
+          if (err) reject(err);
+          else resolve();
+        });
+      });
+    } catch (err) {
+      this.finishSubscription(conn, reqId);
+      throw new WsTransportError(
+        `workflow-server WS subscription send failed: ${describeError(err)}`,
+        { cause: err, delivery: 'not_sent' }
+      );
+    }
+
+    return {
+      reqId,
+      unsubscribe: () => this.finishSubscription(conn, reqId),
+    };
   }
 
   /**
@@ -361,7 +415,13 @@ class WsEventsTransport {
           const headers = await this.resolveUpgradeHeaders();
           const ws = new WebSocket(this.wsUrl, { headers });
           ws.binaryType = 'nodebuffer';
-          conn = { ws, nextReqId: 1, pending: new Map() };
+          conn = {
+            ws,
+            nextReqId: 1,
+            pending: new Map(),
+            subscriptions: new Map(),
+            incoming: Promise.resolve(),
+          };
         } catch (err) {
           console.error(
             `world-vercel: ws events transport could not open a connection ` +
@@ -375,7 +435,7 @@ class WsEventsTransport {
               : new WsTransportError(
                   `workflow-server events WS connection to ${this.wsUrl} ` +
                     `could not be opened: ${describeError(err)}`,
-                  { cause: err }
+                  { cause: err, delivery: 'not_sent' }
                 )
           );
           return;
@@ -405,7 +465,11 @@ class WsEventsTransport {
         });
 
         ws.on('message', (raw: Buffer) => {
-          void this.handleMessage(conn, new Uint8Array(raw));
+          // A stream_end must never overtake a preceding stream_chunk. The
+          // socket preserves message order; retain it across async decoding.
+          conn.incoming = conn.incoming.then(() =>
+            this.handleMessage(conn, new Uint8Array(raw))
+          );
         });
 
         ws.on('error', (err) => {
@@ -414,7 +478,13 @@ class WsEventsTransport {
               `(${this.wsUrl}): ${describeError(err)}`
           );
           if (!opened) {
-            reject(err);
+            reject(
+              new WsTransportError(
+                `workflow-server WS connection to ${this.wsUrl} failed ` +
+                  `before opening: ${describeError(err)}`,
+                { cause: err, delivery: 'not_sent' }
+              )
+            );
             return;
           }
           // `ws` normally follows `'error'` with `'close'`, which tears down and
@@ -434,7 +504,8 @@ class WsEventsTransport {
             reject(
               new WsTransportError(
                 `workflow-server events WS connection to ${this.wsUrl} ` +
-                  `closed before opening (code ${code})`
+                  `closed before opening (code ${code})`,
+                { delivery: 'not_sent' }
               )
             );
           }
@@ -448,6 +519,12 @@ class WsEventsTransport {
             conn,
             new WsTransportError(
               `workflow-server events WS connection closed (code ${code})`
+            )
+          );
+          this.failAllSubscriptions(
+            conn,
+            new WsTransportError(
+              `workflow-server WS connection closed (code ${code})`
             )
           );
 
@@ -569,6 +646,34 @@ class WsEventsTransport {
       return;
     }
 
+    this.dispatchCorrelatedFrame(conn, reqId, decoded);
+  }
+
+  private dispatchCorrelatedFrame(
+    conn: Connection,
+    reqId: number,
+    decoded: DecodedFrame
+  ): void {
+    const subscription = conn.subscriptions.get(reqId);
+    if (subscription) {
+      try {
+        if (subscription.onFrame({ meta: decoded.meta, body: decoded.body })) {
+          this.finishSubscription(conn, reqId);
+        }
+      } catch (err) {
+        this.finishSubscription(conn, reqId);
+        try {
+          subscription.onError(err);
+        } catch (handlerErr) {
+          console.error(
+            `world-vercel: WS subscription error handler failed: ` +
+              describeError(handlerErr)
+          );
+        }
+      }
+      return;
+    }
+
     const pending = conn.pending.get(reqId);
     if (!pending) {
       // The one uncorrelatable case that does NOT tear the connection down: an
@@ -593,6 +698,25 @@ class WsEventsTransport {
     conn.pending.clear();
   }
 
+  private finishSubscription(conn: Connection, reqId: number): void {
+    conn.subscriptions.delete(reqId);
+  }
+
+  private failAllSubscriptions(conn: Connection, err: unknown): void {
+    const subscriptions = [...conn.subscriptions.values()];
+    conn.subscriptions.clear();
+    for (const subscription of subscriptions) {
+      try {
+        subscription.onError(err);
+      } catch (handlerErr) {
+        console.error(
+          `world-vercel: WS subscription error handler failed: ` +
+            describeError(handlerErr)
+        );
+      }
+    }
+  }
+
   /**
    * Fail every waiter on `conn` and drop the socket — for a reply that can't be
    * correlated to a caller, and for a request that outlived its deadline. The
@@ -605,12 +729,13 @@ class WsEventsTransport {
    */
   private failConnection(conn: Connection, message: string): void {
     this.failAllPending(conn, new WsTransportError(message));
+    this.failAllSubscriptions(conn, new WsTransportError(message));
     if (this.connection === conn) this.connection = null;
     conn.ws.close();
   }
 }
 
-const transports = new Map<string, WsEventsTransport>();
+const transports = new Map<string, WsTransport>();
 
 /**
  * Get (or lazily create) the shared WS transport for `wsUrl`. `getHeaders` runs
@@ -627,14 +752,18 @@ export function getWsEventsTransport(
   getHeaders: (opts: {
     forceRefresh: boolean;
   }) => Promise<Record<string, string>>
-): WsEventsTransport {
+): WsTransport {
   let transport = transports.get(wsUrl);
   if (!transport) {
-    transport = new WsEventsTransport(wsUrl, getHeaders);
+    transport = new WsTransport(wsUrl, getHeaders);
     transports.set(wsUrl, transport);
   }
   return transport;
 }
+
+/** Capability-neutral name for new callers. The events export remains for
+ * compatibility with the prototype branch this work is stacked on. */
+export const getWsTransport = getWsEventsTransport;
 
 /**
  * Test seam: close and drop every cached transport, and re-arm the
@@ -650,6 +779,8 @@ export function resetWsEventsTransportsForTest(): void {
   loggedWsInUse = false;
 }
 
+export const resetWsTransportsForTest = resetWsEventsTransportsForTest;
+
 /**
  * Derive the WS endpoint URL for one run from the http(s) base URL used for v4
  * REST calls. `/websockets/v1/runs/:runId` is versioned independently of the
@@ -663,6 +794,8 @@ export function toEventsWsUrl(baseUrl: string, runId: string): string {
   url.pathname = `${url.pathname.replace(/\/$/, '')}/websockets/v1/runs/${encodeURIComponent(runId)}`;
   return url.toString();
 }
+
+export const toWsUrl = toEventsWsUrl;
 
 // =============================================================================
 // Transport selection
@@ -830,7 +963,7 @@ export function resolveWsTransport(
   runId: string,
   config: APIConfig | undefined
 ): {
-  transport: WsEventsTransport;
+  transport: WsTransport;
   wsUrl: string;
 } | null {
   const wsUrl = resolveChannelUrl(runId, config);

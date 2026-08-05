@@ -24,3 +24,9 @@
 export function isWsEventsTransportEnabled(): boolean {
   return process.env.WORKFLOW_EVENTS_TRANSPORT === 'ws';
 }
+
+/** HTTP unless the streams prototype is explicitly enabled. Kept separate
+ * from the events gate so each capability can be benchmarked independently. */
+export function isWsStreamsTransportEnabled(): boolean {
+  return process.env.WORKFLOW_STREAMS_TRANSPORT === 'ws';
+}
