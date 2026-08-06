@@ -84,7 +84,18 @@ different primary stores. vercel-py reads it in
 `_internal/workflow/worlds/vercel.py`. Production runs need nothing: the secret
 resolves to `''` on `main`, so both sides use `vercel-workflow.com`.
 
-CI reaches the deployment past deployment protection through the project's
+That variable is about the *app* reaching the right store. The *driver* reaching
+it is a separate permission, and it is not set in this repo: the branch
+workflow-server (`e2e.vercel-workflow.com`) sits behind deployment protection,
+and a preview run's driver clears it with the workbench project's own identity.
+So `workbench-python-workflow` has to be listed in **that** project's Trusted
+Sources, alongside the JS workbench projects. Until it is, every driver write
+fails with `v4 createEvent: response missing required x-wf-* headers` and a
+`SyntaxError: Unexpected token '<'` — the HTML SSO page, not a workflow-server
+response. Production runs are unaffected: the secret is `''` on `main`, so the
+driver talks to `vercel-workflow.com`, which is not protected.
+
+CI reaches *this* deployment past deployment protection through the project's
 `trustedSources.oidcProviders` entry for `token.actions.githubusercontent.com`.
 A `trustedSources.projects` entry would additionally let a locally pulled
 `VERCEL_OIDC_TOKEN` in; the other workbench projects have one, this project does
