@@ -14,11 +14,19 @@ dependencies = [
 # being built. Bump `rev` deliberately, and re-run the suite when you do.
 #
 # `subdirectory` is required — the vercel-py repo root is a uv workspace whose
-# build backend raises, so only `src/vercel` is installable on its own. The
-# sibling packages it depends on (vercel-queue, vercel-internal-core, ...)
-# resolve from PyPI.
+# build backend raises, so only `src/vercel` is installable on its own. Whether
+# its siblings (vercel-queue, vercel-internal-core, ...) then come from PyPI or
+# from the same git rev is upstream's call, not ours: uv follows workspace
+# sources through a git dependency, so a rev that declares them pulls nine more
+# packages out of the checkout. Read `uv.lock` after a bump — if a fix you are
+# chasing lives in a sibling that resolves from PyPI, the rev did not deliver it.
+#
+# Regenerate the lock with `uv lock --no-config`. A global `exclude-newer` in
+# `~/.config/uv/uv.toml` is otherwise recorded in `uv.lock`, and CI and the
+# Vercel builder — which have no such config — then reject the lock under
+# `--locked`.
 [tool.uv.sources]
-vercel = { git = "https://github.com/vercel/vercel-py", rev = "b4dea16d83ba554e116f71125bda98156644344d", subdirectory = "src/vercel" }
+vercel = { git = "https://github.com/vercel/vercel-py", rev = "e90b0e0ff93c0f23632e45b457a64dad58c7147d", subdirectory = "src/vercel" }
 
 # How `@vercel/python` builds this app. Reached only because `vercel.json`
 # declares `pyproject.toml` as the build src, which puts the builder in

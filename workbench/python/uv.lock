@@ -2,10 +2,6 @@ version = 1
 revision = 3
 requires-python = ">=3.10"
 
-[options]
-exclude-newer = "0001-01-01T00:00:00Z" # This has no effect and is included for backwards compatibility when using relative exclude-newer values.
-exclude-newer-span = "P2D"
-
 [[package]]
 name = "annotated-types"
 version = "0.8.0"
@@ -396,7 +392,7 @@ wheels = [
 [[package]]
 name = "vercel"
 version = "0.8.1"
-source = { git = "https://github.com/vercel/vercel-py?subdirectory=src%2Fvercel&rev=b4dea16d83ba554e116f71125bda98156644344d#b4dea16d83ba554e116f71125bda98156644344d" }
+source = { git = "https://github.com/vercel/vercel-py?subdirectory=src%2Fvercel&rev=e90b0e0ff93c0f23632e45b457a64dad58c7147d#e90b0e0ff93c0f23632e45b457a64dad58c7147d" }
 dependencies = [
     { name = "anyio" },
     { name = "cbor2" },
@@ -638,5 +634,5 @@ dependencies = [
 [package.metadata]
 requires-dist = [
     { name = "uvicorn", specifier = ">=0.30" },
-    { name = "vercel", git = "https://github.com/vercel/vercel-py?subdirectory=src%2Fvercel&rev=b4dea16d83ba554e116f71125bda98156644344d" },
+    { name = "vercel", git = "https://github.com/vercel/vercel-py?subdirectory=src%2Fvercel&rev=e90b0e0ff93c0f23632e45b457a64dad58c7147d" },
 ]

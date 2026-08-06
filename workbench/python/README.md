@@ -12,9 +12,13 @@ Built on [vercel-py](https://github.com/vercel/vercel-py), pinned by commit in
 
 ```bash
 cd workbench/python
-uv sync
+uv sync --locked
 WORKFLOW_PUBLIC_MANIFEST=1 pnpm dev     # uvicorn on :3000
 ```
+
+`--locked` because a plain `uv sync` will quietly rewrite `uv.lock` if your
+personal `~/.config/uv/uv.toml` sets anything that affects resolution — see the
+note above `[tool.uv.sources]` in `pyproject.toml`.
 
 Then, from the repo root:
 
@@ -34,8 +38,10 @@ cd workbench/python && node ./node_modules/workflow/bin/run.js inspect --json ru
 
 ## Running it against the Vercel world
 
-The repo side of this is configured; the Vercel side is not, so there is no
-`python` row in the `e2e-vercel-prod` matrix yet. What is here:
+Both sides are wired: the `workbench-python-workflow` project is rooted at
+`workbench/python` and Git-connected, and the `e2e-vercel-prod` matrix carries a
+`python` row (excluded from the `quickjs` VM axis, which is a JS-engine dimension
+with no Python meaning). What makes the build work:
 
 - `vercel.json` declares `pyproject.toml` as the build src. That is what puts
   `@vercel/python` in "declared-only" mode — without it the `[tool.vercel]`
@@ -69,14 +75,11 @@ The repo side of this is configured; the Vercel side is not, so there is no
 `.python-version` pins 3.14 so the deployed interpreter matches the local venv;
 the builder would otherwise default to 3.12.
 
-What still has to happen outside this repo, in the Vercel Labs team: create a
-project rooted at `workbench/python`, add its `prj_` id and slug to the
-`e2e-vercel-prod` matrix in `.github/workflows/tests.yml` (excluding it from the
-`quickjs` VM axis, which is a JS-engine dimension with no Python meaning), and
-grant it the same deployment-protection exemptions the other workbench projects
-have — the `token.actions.githubusercontent.com` OIDC provider entry for CI, and
-a `trustedSources.projects` entry if you also want a locally pulled
-`VERCEL_OIDC_TOKEN` to reach it.
+CI reaches the deployment past deployment protection through the project's
+`trustedSources.oidcProviders` entry for `token.actions.githubusercontent.com`.
+A `trustedSources.projects` entry would additionally let a locally pulled
+`VERCEL_OIDC_TOKEN` in; the other workbench projects have one, this project does
+not need it for CI.
 
 Nothing about the *protocol* is expected to be the hard part; the divergences
 that will bite are catalogued in vercel-py's queue notes — region routing,
