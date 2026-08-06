@@ -377,6 +377,22 @@ jobs:
           - name: "tanstack-start"
             project-id: "prj_643jeVugTMq5ivsOFQHcbLG1qcnu"
             project-slug: "workbench-tanstack-start-workflow"
+          - name: "python"
+            project-id: "prj_MtdPMACTDJnukz8LzWM65Fob0IVU"
+            project-slug: "workbench-python-workflow"
+        exclude:
+          # `vm` selects the JS engine the workflow body runs on. There is no
+          # Python meaning to that axis — the Python app has one runtime — so
+          # only the `node` half of the pair is a real configuration.
+          #
+          # GitHub Actions matches an `exclude` entry by deep equality on every
+          # key it names, so the whole `app` object has to be repeated verbatim.
+          # Keep it in sync with the entry above.
+          - vm: quickjs
+            app:
+              name: "python"
+              project-id: "prj_MtdPMACTDJnukz8LzWM65Fob0IVU"
+              project-slug: "workbench-python-workflow"
     env:
       TURBO_TOKEN: ${{ secrets.TURBO_TOKEN }}
       TURBO_TEAM: ${{ vars.TURBO_TEAM }}

@@ -19,3 +19,26 @@ dependencies = [
 # resolve from PyPI.
 [tool.uv.sources]
 vercel = { git = "https://github.com/vercel/vercel-py", rev = "b4dea16d83ba554e116f71125bda98156644344d", subdirectory = "src/vercel" }
+
+# How `@vercel/python` builds this app. Reached only because `vercel.json`
+# declares `pyproject.toml` as the build src, which puts the builder in
+# "declared-only" mode: filename-based entrypoint detection never runs, and
+# `[[tool.vercel.workflows]]` is honoured. Without that src the two keys below
+# are silently ignored — a bare ASGI app is not a recognised Python framework,
+# and the builder only attaches workflows to frameworks or declared builds.
+[tool.vercel]
+# The web function. It serves `manifest.json`, which is the only route the e2e
+# driver calls over HTTP on Vercel — runs are delivered through the queue, not
+# through `/flow`.
+entrypoint = "app:app"
+
+# The workflow function. The builder imports this module at build time, reads
+# `vercel.queue.get_subscriptions()`, and emits one `queue/v2beta` trigger per
+# subscription onto a generated `vercel.queue.asgi_app()` handler. Importing
+# `app` is what registers them, because `app.py` calls `workflow_entrypoint()`
+# and `step_entrypoint()` at import.
+#
+# Only one entry is allowed: every workflow consumer receives every `__wkf_*`
+# message, so a second one would fail on runs registered only in the first.
+[[tool.vercel.workflows]]
+entrypoint = "app:registry"

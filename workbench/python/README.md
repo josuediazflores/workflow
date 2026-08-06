@@ -32,6 +32,59 @@ app produced:
 cd workbench/python && node ./node_modules/workflow/bin/run.js inspect --json runs
 ```
 
+## Running it against the Vercel world
+
+The repo side of this is configured; the Vercel side is not, so there is no
+`python` row in the `e2e-vercel-prod` matrix yet. What is here:
+
+- `vercel.json` declares `pyproject.toml` as the build src. That is what puts
+  `@vercel/python` in "declared-only" mode — without it the `[tool.vercel]`
+  keys are ignored, because the builder only attaches workflows to recognised
+  Python frameworks or to declared builds, and a bare ASGI app is neither.
+- `[tool.vercel] entrypoint = "app:app"` builds the web function. On Vercel it
+  serves exactly one useful route, `manifest.json`. Runs arrive over the queue,
+  so the hand-written `POST /flow` adapter is dead code there — it is how the
+  *local* world delivers, and only that.
+- `[[tool.vercel.workflows]] entrypoint = "app:registry"` builds the workflow
+  function. At build time the builder imports `app`, reads
+  `vercel.queue.get_subscriptions()`, and writes one `queue/v2beta` trigger per
+  subscription. You can run that introspection yourself, exactly as the builder
+  does:
+
+  ```bash
+  VERCEL=1 VERCEL_REGION=iad1 VERCEL_DEPLOYMENT_ID=dpl_introspection \
+    uv run python -c 'import importlib; importlib.import_module("app")
+  from vercel.queue import get_subscriptions
+  print([(s.topic, s.consumer_group) for s in get_subscriptions()])'
+  # [('__wkf_workflow_*', 'default'), ('__wkf_step_*', 'default')]
+  ```
+
+  `default` is the point. It is the consumer group `createWorkflowQueueTrigger`
+  writes for the TypeScript SDK on the same topics, which is what makes the
+  platform deliver to a Python consumer at all. Getting there needed
+  vercel/vercel#17236 (`@vercel/python` 6.54.0), which replaced a consumer name
+  derived from the output path with the introspected one, and it requires the
+  installed `vercel` package to be >= 0.8.0.
+
+`.python-version` pins 3.14 so the deployed interpreter matches the local venv;
+the builder would otherwise default to 3.12.
+
+What still has to happen outside this repo, in the Vercel Labs team: create a
+project rooted at `workbench/python`, add its `prj_` id and slug to the
+`e2e-vercel-prod` matrix in `.github/workflows/tests.yml` (excluding it from the
+`quickjs` VM axis, which is a JS-engine dimension with no Python meaning), and
+grant it the same deployment-protection exemptions the other workbench projects
+have — the `token.actions.githubusercontent.com` OIDC provider entry for CI, and
+a `trustedSources.projects` entry if you also want a locally pulled
+`VERCEL_OIDC_TOKEN` to reach it.
+
+Nothing about the *protocol* is expected to be the hard part; the divergences
+that will bite are catalogued in vercel-py's queue notes — region routing,
+JSON-only queue transport, no delivery cap, and a one-second floor on immediate
+re-enqueues.
+
+## Conformance baseline
+
 Which fixtures the suite will run is declared in `e2e-conformance.json`. Anything
 not listed there is skipped; anything listed that the app stops registering fails
 the run rather than quietly skipping. Add a name only once its test passes.
