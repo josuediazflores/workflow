@@ -75,6 +75,15 @@ with no Python meaning). What makes the build work:
 `.python-version` pins 3.14 so the deployed interpreter matches the local venv;
 the builder would otherwise default to 3.12.
 
+The project also needs a `VERCEL_WORKFLOW_SERVER_URL` env var scoped to
+**Preview**, with the same value every other workbench project has. On a PR the
+`e2e-vercel-prod` job points the *driver* at a branch workflow-server
+(`tests.yml:484`); without the matching variable on the project the deployed app
+keeps writing to production `vercel-workflow.com`, and the two sides end up on
+different primary stores. vercel-py reads it in
+`_internal/workflow/worlds/vercel.py`. Production runs need nothing: the secret
+resolves to `''` on `main`, so both sides use `vercel-workflow.com`.
+
 CI reaches the deployment past deployment protection through the project's
 `trustedSources.oidcProviders` entry for `token.actions.githubusercontent.com`.
 A `trustedSources.projects` entry would additionally let a locally pulled
