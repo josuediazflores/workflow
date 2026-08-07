@@ -1,4 +1,8 @@
-import { type Event, envNumber } from '@workflow/world';
+import {
+  type Event,
+  envNumber,
+  isEntityTerminalEventType,
+} from '@workflow/world';
 import { eventsLogger } from './logger.js';
 
 /**
@@ -59,6 +63,12 @@ export interface EventsConsumerOptions {
    */
   onUnconsumedEvent: (event: Event) => void;
   /**
+   * Callback invoked when an event is skipped because its correlation id had
+   * already reached a terminal state earlier in the log. Diagnostics only —
+   * skipping is a normal outcome, not an error.
+   */
+  onPostTerminalEvent?: (event: Event) => void;
+  /**
    * Returns the current promise queue. The unconsumed event check is chained
    * onto this queue so it only fires after all pending async work (e.g.,
    * deserialization) has completed. This prevents false positives when async
@@ -73,10 +83,16 @@ export class EventsConsumer {
   readonly callbacks: EventConsumerCallback[] = [];
   private onConsumedEvent?: (event: Event) => void;
   private onUnconsumedEvent: (event: Event) => void;
+  private onPostTerminalEvent?: (event: Event) => void;
   private getPromiseQueue: () => Promise<void>;
   private pendingUnconsumedCheck: Promise<void> | null = null;
   private pendingUnconsumedTimeout: ReturnType<typeof setTimeout> | null = null;
   private unconsumedCheckVersion = 0;
+  /**
+   * Correlation ids whose terminal event the cursor has already passed. See
+   * {@link EventsConsumer.isPostTerminal}.
+   */
+  private readonly terminalCorrelationIds = new Set<string>();
 
   constructor(events: Event[], options: EventsConsumerOptions) {
     // Own copy: the runtime mutates its event array in place, and a retained
@@ -86,6 +102,7 @@ export class EventsConsumer {
     this.eventIndex = 0;
     this.onConsumedEvent = options.onConsumedEvent;
     this.onUnconsumedEvent = options.onUnconsumedEvent;
+    this.onPostTerminalEvent = options.onPostTerminalEvent;
     this.getPromiseQueue = options.getPromiseQueue;
   }
 
@@ -150,6 +167,13 @@ export class EventsConsumer {
     while (true) {
       const currentEvent = this.events[this.eventIndex] ?? null;
       if (!this.consumeOne(currentEvent)) {
+        // No callback wanted the event. Before treating that as divergence,
+        // check whether it is a late write for an entity the log already
+        // finished — those are ignorable and the cursor moves on.
+        if (currentEvent !== null && this.isPostTerminal(currentEvent)) {
+          this.skipPostTerminal(currentEvent);
+          continue;
+        }
         // No callback consumed the current event; handle the terminal case.
         this.handleUnconsumed(currentEvent);
         return;
@@ -183,6 +207,7 @@ export class EventsConsumer {
         continue;
       }
       if (currentEvent !== null) {
+        this.recordTerminalCorrelationId(currentEvent);
         this.notifyConsumedEvent(currentEvent);
       }
       // consumer handled this event, so increase the event index
@@ -197,6 +222,71 @@ export class EventsConsumer {
       return currentEvent !== null;
     }
     return false;
+  }
+
+  /**
+   * Remembers that `event` put its correlation id into a final state, so any
+   * later event carrying the same id can be skipped rather than treated as
+   * divergence.
+   */
+  private recordTerminalCorrelationId(event: Event) {
+    if (
+      event.correlationId !== undefined &&
+      isEntityTerminalEventType(event.eventType)
+    ) {
+      this.terminalCorrelationIds.add(event.correlationId);
+    }
+  }
+
+  /**
+   * Whether `event` names an entity the cursor already saw reach its terminal
+   * state.
+   *
+   * Such an event is committed but inert. Concurrent replays write into one
+   * log without a currency guard, so a replay working from a prefix that
+   * predates the terminal event can still commit a `step_created` /
+   * `step_started` / `wait_created` for that same entity — or a second
+   * terminal write, against a World that does not enforce one per entity. None
+   * of those can change what the workflow observed: the entity's outcome was
+   * already decided by the terminal event and every later replay reads that
+   * same outcome at the same log position, so ignoring the straggler is
+   * deterministic across replays.
+   *
+   * The check runs only after every registered callback declined the event,
+   * so it can never take an event a consumer wanted. It cannot starve a
+   * consumer that has yet to register either: the entity's own consumer
+   * already ran to completion and deregistered (that is what made the
+   * correlation id terminal), and correlation ids are minted monotonically,
+   * so no future consumer claims this id.
+   */
+  private isPostTerminal(event: Event): boolean {
+    return (
+      event.correlationId !== undefined &&
+      this.terminalCorrelationIds.has(event.correlationId)
+    );
+  }
+
+  private skipPostTerminal(event: Event) {
+    this.eventIndex++;
+    // Deliberately not routed through `notifyConsumedEvent`: the deterministic
+    // clock advances only on events the workflow actually observed. A skipped
+    // event is invisible to the workflow body, and a log that happens to
+    // contain one must produce the same timestamps as a log that does not.
+    eventsLogger.debug(
+      'Skipping event for an already-terminal correlation id',
+      {
+        eventId: event.eventId,
+        eventType: event.eventType,
+        correlationId: event.correlationId,
+      }
+    );
+    try {
+      this.onPostTerminalEvent?.(event);
+    } catch (error) {
+      eventsLogger.error('onPostTerminalEvent callback threw an error', {
+        error,
+      });
+    }
   }
 
   private handleUnconsumed(currentEvent: Event | null) {

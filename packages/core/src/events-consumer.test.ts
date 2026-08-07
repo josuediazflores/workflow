@@ -1,7 +1,11 @@
 import { withResolvers } from '@workflow/utils';
 import type { Event } from '@workflow/world';
 import { describe, expect, it, vi } from 'vitest';
-import { EventConsumerResult, EventsConsumer } from './events-consumer.js';
+import {
+  DEFERRED_CHECK_DELAY_MS,
+  EventConsumerResult,
+  EventsConsumer,
+} from './events-consumer.js';
 
 // Helper function to create mock events
 function createMockEvent(overrides: Partial<Event> = {}): Event {
@@ -25,6 +29,51 @@ const defaultOptions = {
 // Helper function to wait for next tick
 function waitForNextTick(): Promise<void> {
   return new Promise((resolve) => process.nextTick(resolve));
+}
+
+// Waits past the deferred unconsumed-event window so a check that was not
+// cancelled has definitely fired.
+function waitPastDeferredCheck(): Promise<void> {
+  return new Promise((resolve) =>
+    setTimeout(resolve, DEFERRED_CHECK_DELAY_MS * 2)
+  );
+}
+
+// Unlike createMockEvent above, this builds the real `Event` shape, which the
+// post-terminal skip needs: it reads `eventType` and `correlationId`.
+let realEventCounter = 0;
+function createRealEvent(
+  eventType: string,
+  correlationId: string | undefined,
+  overrides: Partial<Event> = {}
+): Event {
+  realEventCounter++;
+  return {
+    eventId: `evnt_${realEventCounter}`,
+    runId: 'wrun_test',
+    eventType,
+    correlationId,
+    eventData: {},
+    createdAt: new Date(),
+    ...overrides,
+  } as unknown as Event;
+}
+
+/**
+ * A consumer for one entity: takes every event carrying `correlationId` and
+ * deregisters once it has taken `terminalType`. This is the shape the runtime's
+ * step/wait consumers have, and the reason a straggler for that id has no
+ * callback left to claim it.
+ */
+function entityConsumer(correlationId: string, terminalType: string) {
+  return vi.fn((event: Event | null) => {
+    if (event === null || event.correlationId !== correlationId) {
+      return EventConsumerResult.NotConsumed;
+    }
+    return event.eventType === terminalType
+      ? EventConsumerResult.Finished
+      : EventConsumerResult.Consumed;
+  });
 }
 
 describe('EventsConsumer', () => {
@@ -474,6 +523,160 @@ describe('EventsConsumer', () => {
 
       // The new callback consumed the event, so onUnconsumedEvent should NOT be called
       expect(onUnconsumedEvent).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('post-terminal events', () => {
+    it('skips a step_started written after step_completed for the same correlation id', async () => {
+      const corr = 'step_A';
+      const events = [
+        createRealEvent('step_created', corr),
+        createRealEvent('step_started', corr),
+        createRealEvent('step_completed', corr),
+        // Written by a concurrent replay working from a prefix that predates
+        // the completion, so it lands after it.
+        createRealEvent('step_started', corr),
+      ];
+      const onUnconsumedEvent = vi.fn();
+      const onPostTerminalEvent = vi.fn();
+      const consumer = new EventsConsumer(events, {
+        onUnconsumedEvent,
+        onPostTerminalEvent,
+        getPromiseQueue: () => Promise.resolve(),
+      });
+
+      consumer.subscribe(entityConsumer(corr, 'step_completed'));
+      await waitPastDeferredCheck();
+
+      expect(consumer.eventIndex).toBe(events.length);
+      expect(onUnconsumedEvent).not.toHaveBeenCalled();
+      expect(onPostTerminalEvent).toHaveBeenCalledTimes(1);
+      expect(onPostTerminalEvent).toHaveBeenCalledWith(events[3]);
+    });
+
+    it('skips a duplicate wait_completed', async () => {
+      const corr = 'wait_A';
+      const events = [
+        createRealEvent('wait_created', corr),
+        createRealEvent('wait_completed', corr),
+        createRealEvent('wait_completed', corr),
+      ];
+      const onUnconsumedEvent = vi.fn();
+      const onPostTerminalEvent = vi.fn();
+      const consumer = new EventsConsumer(events, {
+        onUnconsumedEvent,
+        onPostTerminalEvent,
+        getPromiseQueue: () => Promise.resolve(),
+      });
+
+      consumer.subscribe(entityConsumer(corr, 'wait_completed'));
+      await waitPastDeferredCheck();
+
+      expect(consumer.eventIndex).toBe(events.length);
+      expect(onUnconsumedEvent).not.toHaveBeenCalled();
+      expect(onPostTerminalEvent).toHaveBeenCalledWith(events[2]);
+    });
+
+    it('still reports an unconsumed event whose correlation id never went terminal', async () => {
+      const events = [
+        createRealEvent('step_created', 'step_A'),
+        createRealEvent('step_started', 'step_A'),
+        createRealEvent('step_completed', 'step_A'),
+        // A different entity that no callback ever claims.
+        createRealEvent('wait_created', 'wait_B'),
+      ];
+      const onUnconsumedEvent = vi.fn();
+      const onPostTerminalEvent = vi.fn();
+      const consumer = new EventsConsumer(events, {
+        onUnconsumedEvent,
+        onPostTerminalEvent,
+        getPromiseQueue: () => Promise.resolve(),
+      });
+
+      consumer.subscribe(entityConsumer('step_A', 'step_completed'));
+      await waitPastDeferredCheck();
+
+      expect(consumer.eventIndex).toBe(3);
+      expect(onPostTerminalEvent).not.toHaveBeenCalled();
+      expect(onUnconsumedEvent).toHaveBeenCalledWith(events[3]);
+    });
+
+    it('does not treat step_retrying or hook_received as terminal', async () => {
+      // Neither event ends its entity: a retry writes another step_started, and
+      // a hook keeps receiving until it is disposed. An unclaimed event after
+      // either one is still divergence.
+      const events = [
+        createRealEvent('step_created', 'step_A'),
+        createRealEvent('step_retrying', 'step_A'),
+        createRealEvent('step_started', 'step_A'),
+      ];
+      const onUnconsumedEvent = vi.fn();
+      const consumer = new EventsConsumer(events, {
+        onUnconsumedEvent,
+        getPromiseQueue: () => Promise.resolve(),
+      });
+
+      // Consumes the first two events, then deregisters, leaving the trailing
+      // step_started unclaimed.
+      consumer.subscribe(entityConsumer('step_A', 'step_retrying'));
+      await waitPastDeferredCheck();
+
+      expect(onUnconsumedEvent).toHaveBeenCalledWith(events[2]);
+    });
+
+    it('never takes an event a registered callback still wants', async () => {
+      // A callback that claims post-terminal events wins: the skip is a
+      // last resort, consulted only after every callback declined.
+      const corr = 'hook_A';
+      const events = [
+        createRealEvent('hook_created', corr),
+        createRealEvent('hook_disposed', corr),
+        createRealEvent('hook_received', corr),
+      ];
+      const onUnconsumedEvent = vi.fn();
+      const onPostTerminalEvent = vi.fn();
+      const consumer = new EventsConsumer(events, {
+        onUnconsumedEvent,
+        onPostTerminalEvent,
+        getPromiseQueue: () => Promise.resolve(),
+      });
+
+      const callback = vi.fn((event: Event | null) =>
+        event === null
+          ? EventConsumerResult.NotConsumed
+          : EventConsumerResult.Consumed
+      );
+      consumer.subscribe(callback);
+      await waitPastDeferredCheck();
+
+      expect(consumer.eventIndex).toBe(events.length);
+      expect(callback).toHaveBeenCalledWith(events[2]);
+      expect(onPostTerminalEvent).not.toHaveBeenCalled();
+      expect(onUnconsumedEvent).not.toHaveBeenCalled();
+    });
+
+    it('does not advance the deterministic clock for a skipped event', async () => {
+      const corr = 'step_A';
+      const events = [
+        createRealEvent('step_created', corr),
+        createRealEvent('step_completed', corr),
+        createRealEvent('step_created', corr),
+      ];
+      const onConsumedEvent = vi.fn();
+      const consumer = new EventsConsumer(events, {
+        onConsumedEvent,
+        onUnconsumedEvent: vi.fn(),
+        getPromiseQueue: () => Promise.resolve(),
+      });
+
+      consumer.subscribe(entityConsumer(corr, 'step_completed'));
+      await waitPastDeferredCheck();
+
+      expect(consumer.eventIndex).toBe(events.length);
+      // The workflow body never observed the straggler, so a log containing it
+      // must produce the same timestamps as a log that does not.
+      expect(onConsumedEvent).toHaveBeenCalledTimes(2);
+      expect(onConsumedEvent).not.toHaveBeenCalledWith(events[2]);
     });
   });
 });

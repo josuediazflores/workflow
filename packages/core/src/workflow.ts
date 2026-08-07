@@ -399,6 +399,21 @@ async function createWorkflowSession({
         )
       );
     },
+    onPostTerminalEvent: (event) => {
+      // Not an error: the entity's outcome was already decided at a lower log
+      // position and replay reads that outcome. Logged because a straggler is
+      // still evidence of two replays writing for the same entity, which is
+      // worth seeing when diagnosing a run.
+      runtimeLogger.info(
+        'Ignoring event written after its correlation id was terminal',
+        {
+          workflowRunId: workflowRun.runId,
+          eventId: event.eventId,
+          eventType: event.eventType,
+          correlationId: event.correlationId,
+        }
+      );
+    },
     getPromiseQueue: () => promiseQueueHolder.current,
   });
 

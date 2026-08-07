@@ -85,6 +85,38 @@ export function isTerminalStepEventType(
   return TERMINAL_STEP_EVENT_TYPES.includes(eventType as TerminalStepEventType);
 }
 
+/**
+ * Event types that put the entity named by their `correlationId` into its
+ * final state: a step that completed or failed, a wait that fired, a hook that
+ * was disposed. Once one of these is in the log, the workflow body's consumer
+ * for that correlation id has run to completion and deregistered, so no
+ * further event carrying the same correlation id has a consumer left to claim
+ * it.
+ *
+ * Note the omissions. `step_retrying` is not terminal (a retry writes another
+ * `step_started`), and `hook_received` is not terminal (a hook delivers many
+ * payloads until it is disposed).
+ */
+const EntityTerminalEventTypeSchema = EventTypeSchema.extract([
+  'step_completed',
+  'step_failed',
+  'wait_completed',
+  'hook_disposed',
+] as const);
+export type EntityTerminalEventType = z.infer<
+  typeof EntityTerminalEventTypeSchema
+>;
+export const ENTITY_TERMINAL_EVENT_TYPES =
+  EntityTerminalEventTypeSchema.options;
+
+export function isEntityTerminalEventType(
+  eventType: string
+): eventType is EntityTerminalEventType {
+  return ENTITY_TERMINAL_EVENT_TYPES.includes(
+    eventType as EntityTerminalEventType
+  );
+}
+
 const HookLifecycleEventTypeSchema = EventTypeSchema.extract([
   'hook_created',
   'hook_received',
