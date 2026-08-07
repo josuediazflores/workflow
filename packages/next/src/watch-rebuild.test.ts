@@ -41,6 +41,18 @@ import * as active from './workflows/active';
     expect(extractImportSignature(source)).toBe('./workflows/active');
   });
 
+  test('includes comments in the content hash', () => {
+    const source = 'const value = /* @__PURE__ */ createValue();';
+    const changedSource = 'const value = /* @__NOPE__ */ createValue();';
+
+    expect(
+      createSourceSnapshotFromSource(source, detectWorkflowPatterns).contentHash
+    ).not.toBe(
+      createSourceSnapshotFromSource(changedSource, detectWorkflowPatterns)
+        .contentHash
+    );
+  });
+
   test('ignores workflow definitions inside comments', () => {
     const snapshot = createSourceSnapshotFromSource(
       `
@@ -188,6 +200,34 @@ export const allWorkflows = {} as const;
     expect(decision).toEqual({ kind: 'ignored' });
   });
 
+  test('rebuilds relevant added files without snapshots', async () => {
+    const helperFile = '/app/workflows/helper.ts';
+
+    await expect(
+      classifyRebuild({
+        discoveredEntries: {
+          discoveredSteps: new Set(),
+          discoveredWorkflows: new Set(),
+          discoveredSerdeFiles: new Set(),
+          discoveredFiles: new Set([helperFile]),
+        },
+        fileChanges: {
+          addedFiles: [helperFile],
+          modifiedFiles: [],
+          removedFiles: [],
+        },
+        inputFiles: [],
+        parentHasChild: () => false,
+        readSnapshot: async () =>
+          createSourceSnapshotFromSource(
+            "export const value = 'helper';\n",
+            detectWorkflowPatterns
+          ),
+        sourceSnapshots: new Map(),
+      })
+    ).resolves.toEqual({ kind: 'full' });
+  });
+
   test('ignores byte-identical modified files', async () => {
     const workflowFile = '/app/workflows/example.ts';
     const source = `export async function example() {
@@ -220,23 +260,15 @@ export const allWorkflows = {} as const;
     ).resolves.toEqual({ kind: 'ignored' });
   });
 
-  test('preserves stale add snapshots when modified files are unchanged', async () => {
-    const stepFile = '/app/workflows/step.ts';
+  test('rebuilds changed stale adds used by workflows', async () => {
+    const helperFile = '/app/workflows/helper.ts';
     const workflowFile = '/app/workflows/workflow.ts';
-    const previousStepSnapshot = createSourceSnapshotFromSource(
-      `export async function step() {
-  'use step';
-  return 'before';
-}
-`,
+    const previousHelperSnapshot = createSourceSnapshotFromSource(
+      "export const value = 'before';\n",
       detectWorkflowPatterns
     );
-    const nextStepSnapshot = createSourceSnapshotFromSource(
-      `export async function step() {
-  'use step';
-  return 'after';
-}
-`,
+    const nextHelperSnapshot = createSourceSnapshotFromSource(
+      "export const value = 'after';\n",
       detectWorkflowPatterns
     );
     const workflowSnapshot = createSourceSnapshotFromSource(
@@ -250,21 +282,22 @@ export const allWorkflows = {} as const;
     await expect(
       classifyRebuild({
         discoveredEntries: {
-          discoveredSteps: new Set([stepFile]),
+          discoveredSteps: new Set(),
           discoveredWorkflows: new Set([workflowFile]),
           discoveredSerdeFiles: new Set(),
-          discoveredFiles: new Set([stepFile, workflowFile]),
+          discoveredFiles: new Set([helperFile, workflowFile]),
         },
         fileChanges: {
-          addedFiles: [stepFile],
+          addedFiles: [helperFile],
           modifiedFiles: [workflowFile],
           removedFiles: [],
         },
         inputFiles: [workflowFile],
-        parentHasChild: () => false,
+        parentHasChild: (parent, child) =>
+          parent === workflowFile && child === helperFile,
         readSnapshot: async (file) => {
-          if (file === stepFile) {
-            return nextStepSnapshot;
+          if (file === helperFile) {
+            return nextHelperSnapshot;
           }
           if (file === workflowFile) {
             return workflowSnapshot;
@@ -272,13 +305,14 @@ export const allWorkflows = {} as const;
           throw new Error(`Unexpected file: ${file}`);
         },
         sourceSnapshots: new Map([
-          [stepFile, previousStepSnapshot],
+          [helperFile, previousHelperSnapshot],
           [workflowFile, workflowSnapshot],
         ]),
       })
     ).resolves.toEqual({
-      kind: 'none',
-      snapshots: new Map([[stepFile, nextStepSnapshot]]),
+      kind: 'hot',
+      refreshStepRegistrations: false,
+      snapshots: new Map([[helperFile, nextHelperSnapshot]]),
     });
   });
 });

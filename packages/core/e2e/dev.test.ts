@@ -1258,7 +1258,7 @@ export async function hmrFuzzWorkflow() {
           },
           {
             description: 'new workflow dependency body change',
-            expectedLogCounts: { skip: 0, hot: 1, full: 0 },
+            expectedLogCounts: { skip: 0, hot: 0, full: 1 },
             write: async () => {
               await fs.writeFile(
                 files.importHelper,

@@ -219,9 +219,7 @@ export const createSourceSnapshotFromSource = (
   const patterns = detectWorkflowPatterns(sourceWithoutComments);
 
   return {
-    contentHash: createHash('sha256')
-      .update(sourceWithoutComments)
-      .digest('base64url'),
+    contentHash: createHash('sha256').update(source).digest('base64url'),
     importSignature: extractImportSignature(sourceWithoutComments),
     definitionSignature: extractDefinitionSignature(sourceWithoutComments),
     hasDirective: patterns.hasDirective,
@@ -378,7 +376,7 @@ const pruneStaleAddedFiles = async ({
   sourceSnapshots: Map<string, SourceSnapshot>;
 }) => {
   const nextAddedFiles: string[] = [];
-  const snapshots = new Map<string, SourceSnapshot>();
+  const modifiedFiles: string[] = [];
 
   for (const file of unique(addedFiles)) {
     const previousSnapshot = sourceSnapshots.get(file);
@@ -389,19 +387,15 @@ const pruneStaleAddedFiles = async ({
 
     try {
       const nextSnapshot = await readSnapshot(file);
-      if (didSourceSnapshotChange(previousSnapshot, nextSnapshot)) {
-        nextAddedFiles.push(file);
-        continue;
-      }
       if (previousSnapshot.contentHash !== nextSnapshot.contentHash) {
-        snapshots.set(file, nextSnapshot);
+        modifiedFiles.push(file);
       }
     } catch {
       nextAddedFiles.push(file);
     }
   }
 
-  return { addedFiles: nextAddedFiles, snapshots };
+  return { addedFiles: nextAddedFiles, modifiedFiles };
 };
 
 const modifiedFilesRequireFullRebuild = async ({
@@ -454,9 +448,10 @@ const getChangedRelevantFiles = ({
     inputFiles,
     normalizePath,
   });
-  return unique(fileChanges.modifiedFiles).filter((file) =>
-    relevantFiles.has(file)
-  );
+  return unique([
+    ...fileChanges.addedFiles,
+    ...fileChanges.modifiedFiles,
+  ]).filter((file) => relevantFiles.has(file));
 };
 
 const collectHotRebuildSnapshots = async ({
@@ -566,6 +561,10 @@ export const classifyRebuild = async ({
   const normalizedFileChanges = {
     ...fileChanges,
     addedFiles: prunedAddedFiles.addedFiles,
+    modifiedFiles: unique([
+      ...fileChanges.modifiedFiles,
+      ...prunedAddedFiles.modifiedFiles,
+    ]),
   };
 
   if (
@@ -595,9 +594,7 @@ export const classifyRebuild = async ({
     normalizePath,
   });
   if (changedRelevantFiles.length === 0) {
-    return prunedAddedFiles.snapshots.size > 0
-      ? { kind: 'none', snapshots: prunedAddedFiles.snapshots }
-      : { kind: 'ignored' };
+    return { kind: 'ignored' };
   }
 
   try {
@@ -610,9 +607,7 @@ export const classifyRebuild = async ({
       return { kind: 'full' };
     }
     if (snapshots.size === 0) {
-      return prunedAddedFiles.snapshots.size > 0
-        ? { kind: 'none', snapshots: prunedAddedFiles.snapshots }
-        : { kind: 'ignored' };
+      return { kind: 'ignored' };
     }
     return workflowEntryFilesChanged({
       changedFiles: changedRelevantFiles,

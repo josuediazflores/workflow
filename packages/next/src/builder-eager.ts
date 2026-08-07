@@ -282,23 +282,6 @@ export async function getNextBuilderEager(
           };
 
           await writeManifest(newCombined.manifest);
-          await Promise.all(
-            [
-              ...getRelevantFiles({
-                discoveredEntries,
-                inputFiles: options.inputFiles,
-                normalizePath,
-              }),
-            ].map(async (file) => {
-              if (!nextSourceSnapshots.has(file)) {
-                try {
-                  nextSourceSnapshots.set(file, await readSourceSnapshot(file));
-                } catch {
-                  nextSourceSnapshots.delete(file);
-                }
-              }
-            })
-          );
           sourceSnapshots = nextSourceSnapshots;
         };
 
