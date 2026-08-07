@@ -62,6 +62,18 @@
  *          rather than `readAt` on the first. Measured for two payload shapes
  *          (raw text vs AI-SDK-style structured deltas) so the SO delta between
  *          them isolates serialization cost.
+ * - CRTT  (chunk round-trip time): per-chunk write->read RTT for the same
+ *          paced LLM-shaped stream, measured on the deployment by
+ *          `benchCrttWorkflow`. Every delta embeds `{ seq, writtenAt }` (the SL
+ *          scenario's payload-embedded-timestamp trick applied to every chunk)
+ *          and the reader stamps each chunk's arrival. Samples are aggregated
+ *          INSIDE the reader step into chunk-index buckets (seq 0 / 1-20 /
+ *          21-100 / 101+) and chunk-size buckets (<=256B / 256B-4KB / >4KB, fed
+ *          by a size-sweep variant whose deltas are padded in rotation to
+ *          ~100B/1KB/10KB), and the runner merges the per-iteration summaries
+ *          (exact best/avg/count; percentile-of-percentiles for p50-p99 — see
+ *          mergeRttSummaries). No targets yet: targets come from
+ *          provider-cadence measurement, separately.
  *
  * Scenarios (defined in workbench/example/workflows/97_bench.ts):
  *
@@ -72,6 +84,9 @@
  * 5. benchSlWorkflow              — parallel reader/writer steps → SL
  * 6. benchSoWorkflow              — paced LLM-shaped stream, drained → SO
  *                                   (run in text and structured payload modes)
+ * 7. benchCrttWorkflow            — paced stream of self-timestamping chunks →
+ *                                   CRTT (run in llm-shaped and size-sweep
+ *                                   variants)
  *
  * Each scenario runs many iterations (env-tunable, see BENCH_* below) so the
  * percentiles are computed from real samples.
@@ -92,6 +107,12 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { afterAll, beforeAll, describe, test } from 'vitest';
 import { getTrustedSourcesHeaders } from '../../../scripts/trusted-sources-headers.mjs';
+import {
+  type BenchRttSummary,
+  mergeRttSummaries,
+  RTT_INDEX_BUCKETS,
+  RTT_SIZE_BUCKETS,
+} from '../../../workbench/example/workflows/97_bench_rtt';
 import { getRun } from '../src/runtime';
 import { setupWorld } from './utils';
 
@@ -118,6 +139,9 @@ const envInt = (name: string, fallback: number, min = 1): number => {
 const STREAM_ITERATIONS = envInt('BENCH_STREAM_ITERATIONS', 30);
 const SL_ITERATIONS = envInt('BENCH_SL_ITERATIONS', STREAM_ITERATIONS);
 const SO_ITERATIONS = envInt('BENCH_SO_ITERATIONS', STREAM_ITERATIONS);
+// Each CRTT iteration yields one RTT sample per chunk (300 by default), so
+// fewer iterations than SO already give thousands of samples per bucket.
+const CRTT_ITERATIONS = envInt('BENCH_CRTT_ITERATIONS', 10);
 const SEQUENTIAL_ITERATIONS = envInt('BENCH_SEQUENTIAL_ITERATIONS', 1);
 const SEQUENTIAL_STEP_COUNT = envInt('BENCH_SEQUENTIAL_STEP_COUNT', 1020);
 const WARMUP_ITERATIONS = envInt('BENCH_WARMUP_ITERATIONS', 2, 0);
@@ -217,6 +241,21 @@ interface SoIterationResult {
   runId: string;
   /** `(doneAt - writtenAt) - SO_NOMINAL_DURATION_MS`, deployment-side clocks. */
   soMs: number;
+}
+
+/** Mirrors BenchChunkRttResult in workflows/97_bench.ts: per-bucket RTT
+ * summaries aggregated inside the reader step (buckets without samples are
+ * absent). */
+interface BenchChunkRttResult {
+  received: number;
+  all?: BenchRttSummary;
+  byIndex: Partial<Record<string, BenchRttSummary>>;
+  bySize: Partial<Record<string, BenchRttSummary>>;
+}
+
+interface CrttIterationResult {
+  runId: string;
+  crtt: BenchChunkRttResult;
 }
 
 /** Response shape of the in-deployment `POST /api/bench` trigger route. */
@@ -456,6 +495,43 @@ async function runSoIteration(
   }
 }
 
+async function runCrttIteration(
+  variant: 'llm' | 'sweep'
+): Promise<CrttIterationResult> {
+  // Same chunk count and pacing as the SO scenarios, so the llm-shaped CRTT
+  // numbers describe the exact same workload SO measures in aggregate.
+  const { runId } = await triggerBenchRun('benchCrttWorkflow', [
+    SO_CHUNK_COUNT,
+    SO_INTERVAL_MS,
+    variant,
+  ]);
+  try {
+    const returnValue = await withTimeout(
+      getReturnValue(runId),
+      // The writer streams for the whole generation window before the run can
+      // complete, so extend the guard past the base run timeout by that window.
+      RUN_TIMEOUT_MS + SO_NOMINAL_DURATION_MS,
+      `benchCrttWorkflow (${variant}) returnValue (run ${runId})`
+    );
+    const crtt = (returnValue as { crtt?: BenchChunkRttResult } | undefined)
+      ?.crtt;
+    if (!crtt || !crtt.all || typeof crtt.all.avg !== 'number') {
+      throw new Error(
+        `Run ${runId} returned no chunk-RTT summaries: ${JSON.stringify(returnValue)?.slice(0, 200)}`
+      );
+    }
+    if (crtt.received !== SO_CHUNK_COUNT) {
+      throw new Error(
+        `Run ${runId} consumed ${crtt.received} chunks, expected ${SO_CHUNK_COUNT}`
+      );
+    }
+    return { runId, crtt };
+  } catch (error) {
+    (error as Error).message += ` (run ${runId})`;
+    throw error;
+  }
+}
+
 /**
  * Runs recorded iterations (plus warmups) sequentially — concurrency would
  * contend on the same deployment and skew latencies. Failed iterations are
@@ -524,6 +600,9 @@ interface MetricStats {
   best: number;
   /** Mean; kept in the JSON for reference but not shown in the PR comment. */
   avg: number;
+  /** Median; only recorded for CRTT rows (the exit criteria track median and
+   * average per-chunk RTT). Kept in the JSON, not shown in the PR comment. */
+  p50?: number;
   p75: number;
   p90: number;
   p99: number;
@@ -589,6 +668,35 @@ function recordMetric(
   });
 }
 
+/**
+ * Records one CRTT bucket row from per-iteration summaries. Unlike
+ * recordMetric there are no raw samples in this process — the reader step
+ * aggregated them on the deployment — so the row is the mergeRttSummaries
+ * merge: exact count/best/avg, percentile-of-percentiles for p50-p99.
+ * `samples` is the total chunk count in the bucket across iterations. No
+ * targets yet (see the CRTT header note), so no 🔴 marks render.
+ */
+function recordCrttMetric(
+  scenario: string,
+  summaries: readonly (BenchRttSummary | undefined)[]
+) {
+  const merged = mergeRttSummaries(summaries);
+  if (!merged) return;
+  metricRows.push({
+    metric: 'crtt',
+    scenario,
+    unit: 'ms',
+    best: merged.best,
+    avg: merged.avg,
+    p50: merged.p50,
+    p75: merged.p75,
+    p90: merged.p90,
+    p99: merged.p99,
+    samples: merged.count,
+    raw: [],
+  });
+}
+
 function getBackend(): string {
   if (process.env.WORKFLOW_BENCH_BACKEND) {
     return process.env.WORKFLOW_BENCH_BACKEND;
@@ -613,6 +721,12 @@ const SCENARIO_STREAM_LATENCY = 'stream latency';
 // and re-baseline on the next `main` run.
 const SCENARIO_STREAM_OVERHEAD_TEXT = 'stream overhead (text)';
 const SCENARIO_STREAM_OVERHEAD_STRUCTURED = 'stream overhead (structured)';
+// CRTT scenario labels. Row scenario names are `chunk RTT llm (<bucket>)` /
+// `chunk RTT sweep (<bucket>)` — all new baseline keys, so nothing diffs
+// against pre-existing SL/SO baselines (their scenarios and payloads are
+// untouched) and the CRTT deltas stay blank until `main` produces them.
+const SCENARIO_CHUNK_RTT_LLM = 'chunk RTT (llm)';
+const SCENARIO_CHUNK_RTT_SWEEP = 'chunk RTT (size sweep)';
 const SCENARIO_DESCRIPTIONS = [
   {
     name: SCENARIO_STEP,
@@ -645,6 +759,14 @@ const SCENARIO_DESCRIPTIONS = [
   {
     name: SCENARIO_STREAM_OVERHEAD_STRUCTURED,
     description: `same workload as ${SCENARIO_STREAM_OVERHEAD_TEXT}, but each delta is an AI-SDK-style structured object ({ type: 'text-delta', id, text }) instead of a raw string, so the SO gap vs the text scenario is the added serialization cost`,
+  },
+  {
+    name: SCENARIO_CHUNK_RTT_LLM,
+    description: `writer streams the same paced ${SO_CHUNK_COUNT}-chunk LLM-shaped workload as the SO scenarios, but every delta embeds { seq, writtenAt }; the reader stamps each chunk's arrival and aggregates per-chunk write->read RTT on the deployment, bucketed by chunk index (seq 0 pays the attach/first-delivery cost, then early/mid/steady-state ranges)`,
+  },
+  {
+    name: SCENARIO_CHUNK_RTT_SWEEP,
+    description: `same pacing as ${SCENARIO_CHUNK_RTT_LLM}, but deltas are padded in rotation to ~100B/1KB/10KB serialized so per-chunk RTT is bucketed by chunk size instead (the llm-shaped numbers stay pure of padding)`,
   },
 ];
 
@@ -796,6 +918,50 @@ describe('workflow benchmarks', () => {
     }
   );
 
+  test('scenario: chunk RTT (llm)', { timeout: 30 * 60_000 }, async () => {
+    const results = await runScenario(
+      SCENARIO_CHUNK_RTT_LLM,
+      CRTT_ITERATIONS,
+      () => runCrttIteration('llm')
+    );
+    // The pooled row is the headline (per-chunk RTT averaged independent of
+    // chunk size); the index-bucket rows split it by position in the stream.
+    recordCrttMetric(
+      'chunk RTT llm (all)',
+      results.map((r) => r.crtt.all)
+    );
+    for (const bucket of RTT_INDEX_BUCKETS) {
+      recordCrttMetric(
+        `chunk RTT llm (${bucket})`,
+        results.map((r) => r.crtt.byIndex[bucket])
+      );
+    }
+  });
+
+  test(
+    'scenario: chunk RTT (size sweep)',
+    { timeout: 30 * 60_000 },
+    async () => {
+      const results = await runScenario(
+        SCENARIO_CHUNK_RTT_SWEEP,
+        CRTT_ITERATIONS,
+        () => runCrttIteration('sweep')
+      );
+      recordCrttMetric(
+        'chunk RTT sweep (all)',
+        results.map((r) => r.crtt.all)
+      );
+      // Size buckets only from the sweep variant: the llm-shaped deltas all
+      // land in the smallest bucket, so bucketing them by size says nothing.
+      for (const bucket of RTT_SIZE_BUCKETS) {
+        recordCrttMetric(
+          `chunk RTT sweep (${bucket})`,
+          results.map((r) => r.crtt.bySize[bucket])
+        );
+      }
+    }
+  );
+
   test('scenario: sequential steps', { timeout: 60 * 60_000 }, async () => {
     const results = await runScenario(
       SCENARIO_SEQUENTIAL,
@@ -880,6 +1046,7 @@ describe('workflow benchmarks', () => {
         soChunkCount: SO_CHUNK_COUNT,
         soChunkRatePerSec: SO_CHUNK_RATE_PER_SEC,
         soDurationSeconds: SO_DURATION_SECONDS,
+        crttIterations: CRTT_ITERATIONS,
         sequentialIterations: SEQUENTIAL_ITERATIONS,
         sequentialStepCount: SEQUENTIAL_STEP_COUNT,
         warmupIterations: WARMUP_ITERATIONS,

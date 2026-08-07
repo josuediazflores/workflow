@@ -1,0 +1,140 @@
+// Pure bucketing + aggregation helpers for the chunk round-trip-time (CRTT)
+// benchmark scenario. The workflow half lives in 97_bench.ts
+// (benchCrttWorkflow) and the runner half in
+// packages/core/e2e/benchmark.test.ts.
+//
+// This module is deliberately dependency-free so the same code runs in three
+// places: the reader step aggregates per-chunk RTT samples on the deployment
+// (keeping the workflow return value small — bucketed summaries, not hundreds
+// of raw samples), the benchmark runner merges the per-iteration summaries
+// into one row per bucket, and the unit tests
+// (packages/core/src/bench-chunk-rtt-stats.test.ts) exercise both directly.
+
+/**
+ * Summary of one bucket's RTT samples (all values in ms, rounded to 0.1ms).
+ * Computed inside the reader step per iteration (exact percentiles over that
+ * iteration's samples), then merged across iterations by
+ * {@link mergeRttSummaries}.
+ */
+export interface BenchRttSummary {
+  /** Number of samples aggregated into this summary. */
+  count: number;
+  /** Fastest sample (min). */
+  best: number;
+  /** Mean — the exit criteria's headline "average per-chunk RTT". */
+  avg: number;
+  p50: number;
+  p75: number;
+  p90: number;
+  p99: number;
+}
+
+// Chunk-index buckets, aligned in spirit with the STSO progress split: the
+// first chunk pays the stream's attach/first-delivery cost, seq 1-20 covers
+// the early stream (where a UI is painting first tokens), seq 21-100 the
+// mid-stream ramp, and seq 101+ the steady state of a long response.
+export const RTT_INDEX_BUCKETS = [
+  'seq 0',
+  'seq 1-20',
+  'seq 21-100',
+  'seq 101+',
+] as const;
+export type RttIndexBucket = (typeof RTT_INDEX_BUCKETS)[number];
+
+export function rttIndexBucket(seq: number): RttIndexBucket {
+  if (seq <= 0) return 'seq 0';
+  if (seq <= 20) return 'seq 1-20';
+  if (seq <= 100) return 'seq 21-100';
+  return 'seq 101+';
+}
+
+// Chunk-size buckets (approximate serialized bytes). The boundaries cleanly
+// separate the size-sweep scenario's three padded sizes (~100B / ~1KB / ~10KB)
+// while keeping the LLM-shaped deltas (a few tens of bytes) in the smallest
+// bucket.
+export const RTT_SIZE_BUCKETS = ['<=256B', '256B-4KB', '>4KB'] as const;
+export type RttSizeBucket = (typeof RTT_SIZE_BUCKETS)[number];
+
+export function rttSizeBucket(serializedBytes: number): RttSizeBucket {
+  if (serializedBytes <= 256) return '<=256B';
+  if (serializedBytes <= 4096) return '256B-4KB';
+  return '>4KB';
+}
+
+// Same percentile convention as the benchmark runner's computeStats
+// (nearest-rank via ceil), so a CRTT p90 means the same thing as an SO p90.
+function percentile(sortedAscending: number[], q: number): number {
+  return sortedAscending[
+    Math.min(
+      sortedAscending.length - 1,
+      Math.ceil((q / 100) * sortedAscending.length) - 1
+    )
+  ];
+}
+
+const round = (v: number) => Math.round(v * 10) / 10;
+
+/** Exact summary of one iteration's samples for a bucket; undefined when the
+ * bucket received no samples (so the caller can just skip it). */
+export function summarizeRttSamples(
+  samples: number[]
+): BenchRttSummary | undefined {
+  if (samples.length === 0) return undefined;
+  const sorted = [...samples].sort((a, b) => a - b);
+  return {
+    count: sorted.length,
+    best: round(sorted[0]),
+    avg: round(sorted.reduce((sum, v) => sum + v, 0) / sorted.length),
+    p50: round(percentile(sorted, 50)),
+    p75: round(percentile(sorted, 75)),
+    p90: round(percentile(sorted, 90)),
+    p99: round(percentile(sorted, 99)),
+  };
+}
+
+/**
+ * Merges per-iteration bucket summaries into one summary for reporting.
+ *
+ * `count`, `best`, and `avg` (count-weighted) are exact. The percentiles are
+ * percentile-of-percentiles — pQ over the iterations' pQ values — because the
+ * raw samples never leave the reader step. That is exact at the ends (best;
+ * p99 degenerates to max-of-max when an iteration's p99 is its max, which it
+ * is at the per-bucket sample counts this bench produces) and an approximation
+ * of the pooled percentile in between; good enough for trend tracking, which
+ * is what these rows are for.
+ */
+export function mergeRttSummaries(
+  summaries: readonly (BenchRttSummary | undefined)[]
+): BenchRttSummary | undefined {
+  const present = summaries.filter((s): s is BenchRttSummary => s != null);
+  if (present.length === 0) return undefined;
+  const count = present.reduce((sum, s) => sum + s.count, 0);
+  const mergedPercentile = (q: number, values: number[]) =>
+    round(
+      percentile(
+        [...values].sort((a, b) => a - b),
+        q
+      )
+    );
+  return {
+    count,
+    best: round(Math.min(...present.map((s) => s.best))),
+    avg: round(present.reduce((sum, s) => sum + s.avg * s.count, 0) / count),
+    p50: mergedPercentile(
+      50,
+      present.map((s) => s.p50)
+    ),
+    p75: mergedPercentile(
+      75,
+      present.map((s) => s.p75)
+    ),
+    p90: mergedPercentile(
+      90,
+      present.map((s) => s.p90)
+    ),
+    p99: mergedPercentile(
+      99,
+      present.map((s) => s.p99)
+    ),
+  };
+}

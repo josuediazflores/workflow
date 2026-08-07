@@ -52,8 +52,13 @@ const METRIC_LABELS = {
     description:
       'stream overhead (end-to-end write+consume time beyond the modelled generation window)',
   },
+  crtt: {
+    name: 'CRTT',
+    description:
+      'chunk round-trip time (per-chunk write → read, deployment clocks, aggregated in the reader step; cross-iteration p50-p99 are percentile-of-percentiles, best/avg exact)',
+  },
 };
-const METRIC_ORDER = ['ttfs', 'stso', 'wo', 'sl', 'so'];
+const METRIC_ORDER = ['ttfs', 'stso', 'wo', 'sl', 'so', 'crtt'];
 
 export function parseArgs(argv) {
   const args = {

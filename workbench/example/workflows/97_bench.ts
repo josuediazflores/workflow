@@ -25,9 +25,25 @@
 //   overhead/backpressure. Two payload shapes are supported so the runner can
 //   isolate serialization cost: `'text'` (raw string fragments) and
 //   `'structured'` (AI-SDK-style `{ type: 'text-delta', id, text }` objects).
+// - `benchCrttWorkflow` measures per-chunk round-trip time (CRTT), reusing the
+//   SO setup (paced writer + parallel reader, same deployment, so no clock
+//   skew beyond intra-Vercel NTP bounds) but embedding `{ seq, writtenAt }` in
+//   every chunk — the SL scenario's payload-embedded-timestamp trick applied
+//   to the whole stream. The reader stamps each chunk's arrival, computes
+//   `rtt = Date.now() - chunk.writtenAt`, and aggregates on the deployment
+//   into chunk-index and chunk-size buckets (see 97_bench_rtt.ts), returning
+//   compact per-bucket summaries instead of hundreds of raw samples.
 
 import { createHook, getWorkflowMetadata, getWritable } from 'workflow';
 import { getRun } from 'workflow/api';
+import {
+  type BenchRttSummary,
+  type RttIndexBucket,
+  type RttSizeBucket,
+  rttIndexBucket,
+  rttSizeBucket,
+  summarizeRttSamples,
+} from './97_bench_rtt';
 
 export interface BenchStepTiming {
   /** Date.now() at step body entry */
@@ -107,6 +123,9 @@ const SL_READY_NAMESPACE = 'bench-sl-ready';
 // reader-ready barrier pattern SL uses.
 const SO_STREAM_NAMESPACE = 'bench-so';
 const SO_READY_NAMESPACE = 'bench-so-ready';
+// Dedicated streams for the CRTT scenario, same isolation + barrier pattern.
+const CRTT_STREAM_NAMESPACE = 'bench-crtt';
+const CRTT_READY_NAMESPACE = 'bench-crtt-ready';
 // Deterministic, variable-length text fragments cycled to approximate real
 // token-stream traffic (≈4.5 UTF-8 bytes on average, including punctuation and
 // newline "tokens") while keeping every run byte-for-byte reproducible.
@@ -138,6 +157,40 @@ function soChunk(
     ? { type: 'text-delta', id: SO_STRUCTURED_DELTA_ID, text }
     : text;
 }
+
+/** A self-timestamping CRTT chunk. `text` keeps the payload LLM-shaped (the
+ * same cycled fragments the SO scenarios stream); the `'sweep'` variant adds
+ * `pad` so the serialized chunk size rotates across the size buckets. */
+export interface BenchChunkRttDelta {
+  seq: number;
+  /** Date.now() in the writer step immediately before this chunk's write */
+  writtenAt: number;
+  text: string;
+  pad?: string;
+}
+
+/** CRTT payload variant. `'llm'` streams LLM-shaped deltas (all landing in
+ * the smallest size bucket, so the index-bucket numbers stay pure);
+ * `'sweep'` pads deltas in rotation so per-chunk RTT can be bucketed by
+ * serialized chunk size. */
+export type BenchChunkRttVariant = 'llm' | 'sweep';
+
+/** Reader-side aggregation of one CRTT run: per-bucket summaries computed on
+ * the deployment (see 97_bench_rtt.ts). Buckets that received no samples are
+ * absent. */
+export interface BenchChunkRttResult {
+  /** Number of chunks the reader received (validated against the request) */
+  received: number;
+  /** All chunks pooled — the headline "average per-chunk RTT" summary. */
+  all?: BenchRttSummary;
+  byIndex: Partial<Record<RttIndexBucket, BenchRttSummary>>;
+  bySize: Partial<Record<RttSizeBucket, BenchRttSummary>>;
+}
+
+// Pad lengths cycled by the CRTT `'sweep'` variant. With the ~50B base chunk
+// these serialize to roughly 120B / 1.1KB / 10.3KB — one representative per
+// size bucket (<=256B / 256B-4KB / >4KB).
+const CRTT_SWEEP_PAD_LENGTHS = [64, 1024, 10240];
 
 async function timedNoopStep(index: number): Promise<BenchStepTiming> {
   'use step';
@@ -413,4 +466,156 @@ export async function benchSoWorkflow(
       received: reader.received,
     },
   };
+}
+
+/** Reader half of the CRTT scenario. Same attach/ready handshake as
+ * {@link soReaderStep}, but each received chunk is scored individually:
+ * `rtt = Date.now() - chunk.writtenAt` (clamped at 0 to absorb tiny
+ * intra-Vercel clock skew between the writer's and reader's instances) and
+ * an approximate serialized size (`JSON.stringify` length — the payloads are
+ * ASCII, so chars ≈ UTF-8 bytes). Samples are aggregated into index/size
+ * buckets here in the step, so the workflow returns compact summaries rather
+ * than one number per chunk. */
+async function crttReaderStep(): Promise<BenchChunkRttResult> {
+  'use step';
+  const { workflowRunId } = getWorkflowMetadata();
+  const reader = getRun<BenchChunkRttDelta>(workflowRunId)
+    .getReadable<BenchChunkRttDelta>({ namespace: CRTT_STREAM_NAMESPACE })
+    .getReader();
+  try {
+    // Initiate the read BEFORE signalling ready so the stream GET is in flight
+    // by the time the writer starts (identical to the SL/SO handshake).
+    const firstRead = reader.read();
+
+    const ready = getWritable<{ ready: true }>({
+      namespace: CRTT_READY_NAMESPACE,
+    });
+    const readyWriter = ready.getWriter();
+    await readyWriter.write({ ready: true });
+    readyWriter.releaseLock();
+    await ready.close();
+
+    const all: number[] = [];
+    const byIndex = new Map<RttIndexBucket, number[]>();
+    const bySize = new Map<RttSizeBucket, number[]>();
+    let received = 0;
+    let result = await firstRead;
+    while (!result.done) {
+      const receivedAt = Date.now();
+      const chunk = result.value;
+      if (
+        !chunk ||
+        typeof chunk.seq !== 'number' ||
+        typeof chunk.writtenAt !== 'number'
+      ) {
+        throw new Error(
+          `bench CRTT reader: malformed chunk ${JSON.stringify(chunk)?.slice(0, 120)}`
+        );
+      }
+      const rtt = Math.max(0, receivedAt - chunk.writtenAt);
+      const size = JSON.stringify(chunk).length;
+      all.push(rtt);
+      const push = <K>(map: Map<K, number[]>, key: K) => {
+        const samples = map.get(key);
+        if (samples) samples.push(rtt);
+        else map.set(key, [rtt]);
+      };
+      push(byIndex, rttIndexBucket(chunk.seq));
+      push(bySize, rttSizeBucket(size));
+      received++;
+      result = await reader.read();
+    }
+
+    const summarize = <K extends string>(buckets: Map<K, number[]>) => {
+      const out: Partial<Record<K, BenchRttSummary>> = {};
+      for (const [bucket, samples] of buckets) {
+        out[bucket] = summarizeRttSamples(samples);
+      }
+      return out;
+    };
+    return {
+      received,
+      all: summarizeRttSamples(all),
+      byIndex: summarize(byIndex),
+      bySize: summarize(bySize),
+    };
+  } finally {
+    reader.cancel().catch(() => {});
+  }
+}
+
+/** Writer half of the CRTT scenario: identical pacing to {@link soWriterStep}
+ * (ready barrier, then `chunkCount` chunks at one per `intervalMs`, writing
+ * immediately when behind schedule), but every chunk is self-timestamping —
+ * `writtenAt` is stamped immediately before its write — so the reader can
+ * compute a per-chunk RTT instead of a whole-stream span. */
+async function crttWriterStep(
+  chunkCount: number,
+  intervalMs: number,
+  variant: BenchChunkRttVariant
+): Promise<void> {
+  'use step';
+  const { workflowRunId } = getWorkflowMetadata();
+  const readyReader = getRun<{ ready: true }>(workflowRunId)
+    .getReadable<{ ready: true }>({ namespace: CRTT_READY_NAMESPACE })
+    .getReader();
+  try {
+    await readyReader.read();
+  } finally {
+    readyReader.cancel().catch(() => {});
+  }
+
+  const writable = getWritable<BenchChunkRttDelta>({
+    namespace: CRTT_STREAM_NAMESPACE,
+  });
+  const writer = writable.getWriter();
+  const startedAt = Date.now();
+  for (let i = 0; i < chunkCount; i++) {
+    const delay = startedAt + (i + 1) * intervalMs - Date.now();
+    if (delay > 0) {
+      await new Promise((resolve) => setTimeout(resolve, delay));
+    }
+    const chunk: BenchChunkRttDelta = {
+      seq: i,
+      writtenAt: Date.now(),
+      text: SO_TEXT_FRAGMENTS[i % SO_TEXT_FRAGMENTS.length],
+    };
+    if (variant === 'sweep') {
+      chunk.pad = 'x'.repeat(
+        CRTT_SWEEP_PAD_LENGTHS[i % CRTT_SWEEP_PAD_LENGTHS.length]
+      );
+    }
+    await writer.write(chunk);
+  }
+  writer.releaseLock();
+  await writable.close();
+}
+
+/**
+ * Scenario 7: per-chunk round-trip time (CRTT), measured entirely on the
+ * deployment.
+ *
+ * Same shape as the SO scenario (paced writer + parallel draining reader on a
+ * dedicated namespaced stream, reader-ready barrier), but the measurement is
+ * per chunk rather than per stream: every delta embeds `{ seq, writtenAt }`
+ * (the SL scenario's payload-embedded-timestamp trick applied to all chunks),
+ * and the reader computes each chunk's write->read RTT on arrival. The reader
+ * aggregates the samples on the deployment into chunk-index buckets and
+ * chunk-size buckets (see 97_bench_rtt.ts) and the workflow returns those
+ * compact summaries. The `'llm'` variant streams the same LLM-shaped deltas as
+ * SO (index bucketing on pure token-shaped traffic); the `'sweep'` variant
+ * pads deltas in rotation to ~100B/1KB/10KB so RTT can be compared across
+ * chunk sizes.
+ */
+export async function benchCrttWorkflow(
+  chunkCount: number,
+  intervalMs: number,
+  variant: BenchChunkRttVariant = 'llm'
+): Promise<{ crtt: BenchChunkRttResult }> {
+  'use workflow';
+  const [crtt] = await Promise.all([
+    crttReaderStep(),
+    crttWriterStep(chunkCount, intervalMs, variant),
+  ]);
+  return { crtt };
 }
