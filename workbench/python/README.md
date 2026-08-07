@@ -115,10 +115,30 @@ A `trustedSources.projects` entry would additionally let a locally pulled
 `VERCEL_OIDC_TOKEN` in; the other workbench projects have one, this project does
 not need it for CI.
 
-Nothing about the *protocol* is expected to be the hard part; the divergences
-that will bite are catalogued in vercel-py's queue notes — region routing,
-JSON-only queue transport, no delivery cap, and a one-second floor on immediate
-re-enqueues.
+The divergences that bite are catalogued in vercel-py's queue notes — region
+routing, JSON-only queue transport, no delivery cap, and a one-second floor on
+immediate re-enqueues.
+
+**One of them currently blocks this lane outright.** With the builder pinned and
+queue mode reached, every delivery still 500s:
+
+```
+transports.py:136  text = (await _collect_bytes_async(payload)).decode("utf-8")
+UnicodeDecodeError: 'utf-8' codec can't decode byte 0xb9 in position 0
+→ MessageCorruptedError: Message … is corrupted: Failed to parse payload
+```
+
+`0xb9` is CBOR. `@workflow/world-vercel` publishes the invoke payload with
+`CborTransport` (`packages/world-vercel/src/queue.ts:34`) for `specVersion >= 3`,
+and vercel-py's queue consumer has only a JSON path — `subscribe()` takes no
+`transport`, and the default `RawJsonTransport` ignores `content_type` and
+always decodes UTF-8. Nothing in this repo can override either side without
+pinning the lane to a legacy spec version, which would defeat the point of
+having it. It needs a CBOR transport in vercel-py; tracked as §6 of that repo's
+`python-ts-queue-divergences.md`.
+
+`world-local` is unaffected — Python is producer and consumer there, so JSON on
+both ends is self-consistent, and the local conformance lane passes.
 
 ## Conformance baseline
 
