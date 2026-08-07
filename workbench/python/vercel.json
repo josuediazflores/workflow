@@ -10,7 +10,7 @@
   "builds": [
     {
       "src": "pyproject.toml",
-      "use": "@vercel/python"
+      "use": "@vercel/python@6.55.1"
     }
   ]
 }

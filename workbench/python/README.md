@@ -47,6 +47,17 @@ with no Python meaning). What makes the build work:
   `@vercel/python` in "declared-only" mode — without it the `[tool.vercel]`
   keys are ignored, because the builder only attaches workflows to recognised
   Python frameworks or to declared builds, and a bare ASGI app is neither.
+- That `use` carries an **explicit builder version**, which the other workbench
+  projects do not need. An unpinned `use` resolves to whatever `@vercel/python`
+  ships inside the Vercel CLI the build platform happens to run, and that lags
+  npm — builds were picking up 6.53.0 (CLI 58.1.0) well after 6.55.x was out.
+  6.53.0 predates queue mode, so the builder silently fell back to "workers"
+  mode and pointed the workflow function straight at `app:registry`. That is a
+  `Workflows` object, not an ASGI callable, so every queue delivery 500'd with
+  `Could not determine the application interface for 'app:registry'` — the run
+  was created, the message was delivered, and nothing ever executed. Everything
+  below about consumer groups depends on queue mode, so the pin is what makes it
+  reachable at all. Bump it deliberately.
 - `[tool.vercel] entrypoint = "app:app"` builds the web function. On Vercel it
   serves exactly one useful route, `manifest.json`. Runs arrive over the queue,
   so the hand-written `POST /flow` adapter is dead code there — it is how the
