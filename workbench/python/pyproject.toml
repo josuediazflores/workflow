@@ -26,7 +26,7 @@ dependencies = [
 # Vercel builder — which have no such config — then reject the lock under
 # `--locked`.
 [tool.uv.sources]
-vercel = { git = "https://github.com/vercel/vercel-py", rev = "e90b0e0ff93c0f23632e45b457a64dad58c7147d", subdirectory = "src/vercel" }
+vercel = { git = "https://github.com/vercel/vercel-py", rev = "a36e0f55b2bc0d762225acd7e60abe32f5b3445a", subdirectory = "src/vercel" }
 
 # How `@vercel/python` builds this app. Reached only because `vercel.json`
 # declares `pyproject.toml` as the build src, which puts the builder in
@@ -44,7 +44,7 @@ entrypoint = "app:app"
 # `vercel.queue.get_subscriptions()`, and emits one `queue/v2beta` trigger per
 # subscription onto a generated `vercel.queue.asgi_app()` handler. Importing
 # `app` is what registers them, because `app.py` calls `workflow_entrypoint()`
-# and `step_entrypoint()` at import.
+# at import.
 #
 # Only one entry is allowed: every workflow consumer receives every `__wkf_*`
 # message, so a second one would fail on runs registered only in the first.

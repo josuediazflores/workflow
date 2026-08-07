@@ -25,7 +25,7 @@ from typing import Any, AsyncIterator, Callable
 
 import httpx
 from vercel._internal.workflow import world as w
-from vercel._internal.workflow.runtime import step_entrypoint, workflow_entrypoint
+from vercel._internal.workflow.runtime import workflow_entrypoint
 
 # The fixture module is named to match `workbench/example/workflows/99_e2e.ts`,
 # which a plain `import` statement cannot express — a module name may not start
@@ -34,11 +34,11 @@ FIXTURES_MODULE = "workflows.99_e2e"
 fixtures = importlib.import_module(FIXTURES_MODULE)
 registry = fixtures.app
 
-# Both entrypoints have to exist even though HTTP only ever reaches the workflow
-# one: creating them is what subscribes them to their queue topics, and the step
-# subscriber is how in-process step dispatch gets delivered.
+# One entrypoint serves both replays and step invocations: since vercel-py #251
+# a step rides the `__wkf_workflow_*` topic as a `stepId` on the invoke payload,
+# matching the TypeScript SDK. Calling this is also what subscribes the handler
+# to that topic, which is how in-process dispatch gets delivered.
 flow_handler = workflow_entrypoint(registry)
-step_entrypoint(registry)
 
 ROUTE_BASE = "/.well-known/workflow/v1"
 MANIFEST_VERSION = "1.0.0"

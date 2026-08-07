@@ -392,7 +392,7 @@ wheels = [
 [[package]]
 name = "vercel"
 version = "0.8.1"
-source = { git = "https://github.com/vercel/vercel-py?subdirectory=src%2Fvercel&rev=e90b0e0ff93c0f23632e45b457a64dad58c7147d#e90b0e0ff93c0f23632e45b457a64dad58c7147d" }
+source = { git = "https://github.com/vercel/vercel-py?subdirectory=src%2Fvercel&rev=a36e0f55b2bc0d762225acd7e60abe32f5b3445a#a36e0f55b2bc0d762225acd7e60abe32f5b3445a" }
 dependencies = [
     { name = "anyio" },
     { name = "cbor2" },
@@ -634,5 +634,5 @@ dependencies = [
 [package.metadata]
 requires-dist = [
     { name = "uvicorn", specifier = ">=0.30" },
-    { name = "vercel", git = "https://github.com/vercel/vercel-py?subdirectory=src%2Fvercel&rev=e90b0e0ff93c0f23632e45b457a64dad58c7147d" },
+    { name = "vercel", git = "https://github.com/vercel/vercel-py?subdirectory=src%2Fvercel&rev=a36e0f55b2bc0d762225acd7e60abe32f5b3445a" },
 ]

@@ -62,8 +62,11 @@ with no Python meaning). What makes the build work:
     uv run python -c 'import importlib; importlib.import_module("app")
   from vercel.queue import get_subscriptions
   print([(s.topic, s.consumer_group) for s in get_subscriptions()])'
-  # [('__wkf_workflow_*', 'default'), ('__wkf_step_*', 'default')]
+  # [('__wkf_workflow_*', 'default')]
   ```
+
+  One topic, not two: since vercel-py #251 a step invocation rides the workflow
+  topic as a `stepId` on the invoke payload, the way the TypeScript SDK does it.
 
   `default` is the point. It is the consumer group `createWorkflowQueueTrigger`
   writes for the TypeScript SDK on the same topics, which is what makes the
@@ -145,9 +148,8 @@ This app is honest about being early. In rough order of how much it costs:
   exactly the headers `@workflow/world-local` sends — so the adapter is routing
   plus a manifest, and it belongs here because it implements a contract the SDK
   does not claim to serve.
-- **Imports reach into `vercel._internal`.** `workflow_entrypoint`,
-  `step_entrypoint`, and the `HTTPRequest` base are all private. There is no
-  public equivalent.
+- **Imports reach into `vercel._internal`.** Both `workflow_entrypoint` and the
+  `HTTPRequest` base are private. There is no public equivalent.
 - **No health check.** vercel-py defines `HealthCheckPayload` and nothing consumes
   it, so the three health-check tests are marked JS-only. `GET flow?__health`
   here answers `{"status": "ok"}` for port discovery only — it is not the
