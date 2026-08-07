@@ -55,7 +55,7 @@ const METRIC_LABELS = {
   crtt: {
     name: 'CRTT',
     description:
-      'chunk round-trip time (per-chunk write → read, deployment clocks, aggregated in the reader step; cross-iteration p50-p99 are percentile-of-percentiles, best/avg exact)',
+      'chunk round-trip time (per-chunk write → read latency; the "round trip" is deployment → stream backend → reader on the same deployment — same clock domain — not an echo back to the writer; aggregated in the reader step, so cross-iteration p50-p99 are percentile-of-percentiles while best/avg and the histograms are exact)',
   },
 };
 const METRIC_ORDER = ['ttfs', 'stso', 'wo', 'sl', 'so', 'crtt'];
@@ -125,17 +125,19 @@ export function extractHistory(body) {
 }
 
 /**
- * Drops the per-metric raw sample arrays before embedding an entry in the
- * comment's data block. The sequential-steps scenario records ~1000 STSO
- * samples per run (plus the baseline's), which would blow past GitHub's
- * comment size limit within a couple of history entries; the percentiles and
- * baseline annotations — everything the history tables render — are kept.
+ * Drops the per-metric raw sample arrays (and the CRTT fixed-bin histograms)
+ * before embedding an entry in the comment's data block. The sequential-steps
+ * scenario records ~1000 STSO samples per run (plus the baseline's), which
+ * would blow past GitHub's comment size limit within a couple of history
+ * entries; the percentiles and baseline annotations — everything the history
+ * tables render — are kept.
  *
- * This does not affect the histogram diff against `main`: that reads its
- * baseline from the artifacts the workflow downloads into --baseline-dir,
- * which keep their raw samples. What it costs is the collapsed "Previous
- * results" entries, re-rendered from this block on a later commit of the same
- * PR — they show their tables but not their histograms.
+ * This does not affect the distribution diffs against `main`: those read
+ * their baselines from the artifacts the workflow downloads into
+ * --baseline-dir, which keep raw samples and histograms. What it costs is the
+ * collapsed "Previous results" entries, re-rendered from this block on a
+ * later commit of the same PR — they show their tables but not their
+ * histograms.
  */
 function stripRawSamples(entries) {
   return entries.map((entry) => ({
@@ -143,7 +145,7 @@ function stripRawSamples(entries) {
     results: (entry.results ?? []).map((result) => ({
       ...result,
       metrics: (result.metrics ?? []).map(
-        ({ raw, baselineRaw, ...row }) => row
+        ({ raw, baselineRaw, hist, baselineHist, ...row }) => row
       ),
     })),
   }));
@@ -215,6 +217,9 @@ const BASELINE_FIELDS = [
   { annotation: 'baselineP75', from: (base) => base.p75 },
   { annotation: 'baselineP90', from: (base) => base.p90 },
   { annotation: 'baselineP99', from: (base) => base.p99 },
+  // Not rendered in the table (there is no Avg column), but the CRTT
+  // distribution section headlines its exact avg with a vs-main delta.
+  { annotation: 'baselineAvg', from: (base) => base.avg },
 ];
 
 export function annotateWithBaseline(results, baseline) {
@@ -240,6 +245,16 @@ export function annotateWithBaseline(results, baseline) {
     // histogram diff below the table — kept separate from BASELINE_FIELDS
     // since it's an array, not a numeric percentile.
     if (Array.isArray(base.raw)) annotated.baselineRaw = base.raw;
+    // Fixed-bin histograms drive the CRTT distribution diff. Only annotate
+    // when the bin edges match exactly — counts over different edges cannot
+    // be diffed, and edges may change across bench versions.
+    if (
+      Array.isArray(base.hist?.counts) &&
+      Array.isArray(row.hist?.counts) &&
+      JSON.stringify(base.hist.edgesMs) === JSON.stringify(row.hist.edgesMs)
+    ) {
+      annotated.baselineHist = base.hist;
+    }
     return annotated;
   };
   return results.map((result) => ({
@@ -376,8 +391,13 @@ function renderOverlayBar(base, cur, maxCount) {
  * and their delta on the same line (a fenced code block keeps everything
  * aligned in a monospace font). This is the whole histogram diff — the shape
  * of the two distributions and the per-bucket numbers behind it, without a
- * second table restating them. */
-function renderStsoBarChart(buckets, { selfDiff } = {}) {
+ * second table restating them. Shared by the STSO section (buckets = step
+ * counts) and the CRTT section (buckets = chunk counts); `selfLabel` names
+ * the series when there is no baseline to overlay. */
+function renderHistogramBarChart(
+  buckets,
+  { selfDiff, selfLabel = 'steps' } = {}
+) {
   const maxCount = Math.max(1, ...buckets.map((b) => Math.max(b.base, b.cur)));
   const labelWidth = Math.max(...buckets.map((b) => b.label.length));
   const countWidth = Math.max(
@@ -395,7 +415,7 @@ function renderStsoBarChart(buckets, { selfDiff } = {}) {
         : renderOverlayBar(base, cur, maxCount)
     ).padEnd(BAR_CHART_WIDTH);
     const counts = selfDiff
-      ? `steps ${String(cur).padStart(countWidth)}`
+      ? `${selfLabel} ${String(cur).padStart(countWidth)}`
       : `main ${String(base).padStart(countWidth)}  this ${String(cur).padStart(countWidth)}  ${formatDeltaValue(cur - base).padStart(countWidth + 1)}`;
     lines.push(`${label.padStart(labelWidth)} ms  ${bar}  ${counts}`);
   }
@@ -451,7 +471,7 @@ function renderStsoRowDiff(row) {
     );
   }
   if (buckets.length > 0) {
-    lines.push(renderStsoBarChart(buckets, { selfDiff }));
+    lines.push(renderHistogramBarChart(buckets, { selfDiff }));
   }
   return lines.join('\n');
 }
@@ -480,6 +500,112 @@ function renderStsoDiffSection(result) {
     `<summary>📈 STSO distribution${anyBaseline ? ' vs main' : ''} (inline / queue-hop histograms)</summary>`,
     '',
     ...rows.map(renderStsoRowDiff),
+    '',
+    '</details>',
+  ].join('\n');
+}
+
+// ============================================================================
+// CRTT distribution diff (fixed log-bin histograms, vs main)
+// ============================================================================
+
+/** Bucket label for fixed-edge histogram bin `i`: `<e0` for the first bin,
+ * `e(n-1)+` for the overflow bin, `a-b` in between. */
+function histBinLabel(edges, i) {
+  if (i === 0) return `<${edges[0]}`;
+  if (i >= edges.length) return `${edges[edges.length - 1]}+`;
+  return `${edges[i - 1]}-${edges[i]}`;
+}
+
+/** (label, main count, this-run count) triples for a fixed-edge histogram
+ * pair, skipping bins empty on both sides (log bins cover µs-to-seconds, so
+ * most rows only occupy a handful of them). */
+function nonEmptyHistBuckets(edges, curCounts, baseCounts) {
+  const buckets = [];
+  const bins = Math.max(curCounts.length, baseCounts.length);
+  for (let i = 0; i < bins; i++) {
+    const cur = curCounts[i] ?? 0;
+    const base = baseCounts[i] ?? 0;
+    if (cur === 0 && base === 0) continue;
+    buckets.push({ label: histBinLabel(edges, i), base, cur });
+  }
+  return buckets;
+}
+
+/** Renders one CRTT row's average line and histogram diff (this run vs
+ * main). Unlike the STSO diff there are no raw samples to re-bin — the
+ * reader step aggregated into fixed log bins on the deployment — which is
+ * exactly what makes the diff exact: identical edges on both sides. */
+function renderCrttRowDiff(row) {
+  const selfDiff =
+    !Array.isArray(row.baselineHist?.counts) ||
+    typeof row.baselineAvg !== 'number';
+  const baselineCounts = selfDiff ? row.hist.counts : row.baselineHist.counts;
+  const buckets = nonEmptyHistBuckets(
+    row.hist.edgesMs,
+    row.hist.counts,
+    baselineCounts
+  );
+
+  // Avgs come rounded to 0.1ms from the bench, but round here too so a
+  // baseline from any producer can't leak float noise into the headline.
+  const fmtAvg = (v) => Math.round(v * 10) / 10;
+  const lines = ['', `_${row.scenario}_`, ''];
+  if (selfDiff) {
+    lines.push(`Avg RTT: ${fmtAvg(row.avg)}ms over ${row.samples} chunks`, '');
+  } else {
+    // The avg is exact on both sides (count-weighted merge), so it is the
+    // honest headline delta for a distribution whose table percentiles are
+    // approximations.
+    const delta = row.avg - row.baselineAvg;
+    const pct =
+      row.baselineAvg > 0
+        ? `, ${formatDeltaValue((delta / row.baselineAvg) * 100)}%`
+        : '';
+    lines.push(
+      `Avg RTT: main ${fmtAvg(row.baselineAvg)}ms → this run ${fmtAvg(row.avg)}ms (Δ ${formatDeltaValue(delta, 'ms')}${pct})`,
+      ''
+    );
+  }
+  if (buckets.length > 0) {
+    lines.push(
+      renderHistogramBarChart(buckets, { selfDiff, selfLabel: 'chunks' })
+    );
+  }
+  return lines.join('\n');
+}
+
+/**
+ * Renders a per-bucket histogram diff against `main` for every CRTT row that
+ * carries a fixed-bin histogram — the CRTT counterpart of the STSO
+ * distribution section. Percentile columns hide both the shape (a delivery
+ * cadence shows up as a hump, not a number) and *how many* chunks moved;
+ * these histograms show both, and — because the bins are fixed and merged by
+ * summation — they are exact where the table's cross-iteration percentiles
+ * are percentile-of-percentiles approximations.
+ *
+ * Collapsed by default, like the STSO section: a drill-down, not the
+ * headline.
+ */
+function renderCrttDiffSection(result) {
+  const rows = (result.metrics ?? []).filter(
+    (row) => row.metric === 'crtt' && Array.isArray(row.hist?.counts)
+  );
+  if (rows.length === 0) return '';
+  const anyBaseline = rows.some((row) =>
+    Array.isArray(row.baselineHist?.counts)
+  );
+  return [
+    '',
+    '<details>',
+    `<summary>📈 CRTT distribution${anyBaseline ? ' vs main' : ''} (per-chunk RTT histograms)</summary>`,
+    '',
+    ...(anyBaseline
+      ? []
+      : [
+          "<sub>No `main` baseline with histograms yet — showing this run's distributions on their own; the diffs appear once a run on `main` has recorded them.</sub>",
+        ]),
+    ...rows.map(renderCrttRowDiff),
     '',
     '</details>',
   ].join('\n');
@@ -574,12 +700,14 @@ function renderEntry(entry, { heading }) {
       lines.push(`Backend: \`${result.backend}\` · app: \`${result.app}\``, '');
     }
     lines.push(renderResultTable(result), '');
-    // Only the latest entry carries raw samples (they are stripped before
-    // being embedded in the comment's data block, see stripRawSamples), so
-    // this renders for the current run and is silently skipped for the
-    // collapsed history entries.
+    // Only the latest entry carries raw samples and histograms (they are
+    // stripped before being embedded in the comment's data block, see
+    // stripRawSamples), so these render for the current run and are silently
+    // skipped for the collapsed history entries.
     const stsoDiff = renderStsoDiffSection(result);
     if (stsoDiff) lines.push(stsoDiff, '');
+    const crttDiff = renderCrttDiffSection(result);
+    if (crttDiff) lines.push(crttDiff, '');
   }
   return lines.join('\n');
 }
@@ -638,10 +766,22 @@ function renderFooter(entries) {
     )
   );
 
+  const hasCrttDistribution = results.some((result) =>
+    (result.metrics ?? []).some(
+      (row) => row.metric === 'crtt' && Array.isArray(row.hist?.counts)
+    )
+  );
+
   const smallprint = [
     ...(hasStsoDistribution
       ? [
           '<sub>The collapsed **STSO distribution** section above buckets every step gap of the sequential-steps run (not a sampled window), split by whether the step ending the gap ran **inline** — in the same warm process as the step before it, so the gap is pure framework overhead — or after a **queue-hop** — the first step of a fresh process, which pays queue dispatch, client reinit and event-log replay. Bars overlay the two runs: `█` is `main`, `┃` marks where this run lands, `░` bridges the gap when this run has more samples in a bucket.</sub>',
+          '',
+        ]
+      : []),
+    ...(hasCrttDistribution
+      ? [
+          "<sub>The collapsed **CRTT distribution** section buckets every chunk's write→read latency into fixed log-scale bins (1-2-5 series), aggregated inside the reader step on the deployment and merged by summation — so unlike the table's cross-iteration CRTT percentiles (percentile-of-percentiles), the histograms and the avg line are exact. Bars overlay `main` and this run the same way as the STSO section.</sub>",
           '',
         ]
       : []),

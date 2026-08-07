@@ -27,6 +27,36 @@ export interface BenchRttSummary {
   p75: number;
   p90: number;
   p99: number;
+  /** Fixed-bin histogram of the samples (see {@link RTT_HIST_EDGES_MS}):
+   * `hist[i]` counts samples in `[edges[i-1], edges[i])`, with `hist[0]`
+   * below the first edge and the last entry at/above the last edge. Because
+   * the edges are a shared constant, histograms merge exactly — across
+   * iterations and across benchmark runs — unlike the percentile fields. */
+  hist: number[];
+}
+
+// Histogram bin edges (ms), a 1-2-5 log series. Log-scale bins keep
+// resolution at both ends of the plausible range — a warm in-region
+// write->read can be single-digit ms while a stalled delivery is over a
+// second — and fixed shared edges are what make cross-run histogram diffs
+// exact (adaptive widths, like the STSO section's, cannot be re-binned once
+// the raw samples have been left behind on the deployment).
+export const RTT_HIST_EDGES_MS = [
+  1, 2, 5, 10, 20, 50, 100, 200, 500, 1000, 2000, 5000,
+];
+
+/** Buckets samples into the fixed {@link RTT_HIST_EDGES_MS} bins. Returns
+ * `edges.length + 1` counts (last = at/above the final edge). */
+export function histogramRttSamples(samples: number[]): number[] {
+  const counts = new Array(RTT_HIST_EDGES_MS.length + 1).fill(0);
+  for (const v of samples) {
+    let bin = 0;
+    while (bin < RTT_HIST_EDGES_MS.length && v >= RTT_HIST_EDGES_MS[bin]) {
+      bin++;
+    }
+    counts[bin]++;
+  }
+  return counts;
 }
 
 // Chunk-index buckets, aligned in spirit with the STSO progress split: the
@@ -85,6 +115,7 @@ export function summarizeRttSamples(
     count: sorted.length,
     best: round(sorted[0]),
     avg: round(sorted.reduce((sum, v) => sum + v, 0) / sorted.length),
+    hist: histogramRttSamples(sorted),
     p50: round(percentile(sorted, 50)),
     p75: round(percentile(sorted, 75)),
     p90: round(percentile(sorted, 90)),
@@ -95,13 +126,15 @@ export function summarizeRttSamples(
 /**
  * Merges per-iteration bucket summaries into one summary for reporting.
  *
- * `count`, `best`, and `avg` (count-weighted) are exact. The percentiles are
+ * `count`, `best`, `avg` (count-weighted), and `hist` (elementwise sum over
+ * the shared fixed bins) are exact. The percentiles are
  * percentile-of-percentiles — pQ over the iterations' pQ values — because the
  * raw samples never leave the reader step. That is exact at the ends (best;
  * p99 degenerates to max-of-max when an iteration's p99 is its max, which it
  * is at the per-bucket sample counts this bench produces) and an approximation
  * of the pooled percentile in between; good enough for trend tracking, which
- * is what these rows are for.
+ * is what these rows are for. The histogram is the exact view of the pooled
+ * distribution.
  */
 export function mergeRttSummaries(
   summaries: readonly (BenchRttSummary | undefined)[]
@@ -116,10 +149,18 @@ export function mergeRttSummaries(
         q
       )
     );
+  const histLength = Math.max(...present.map((s) => s.hist?.length ?? 0));
+  const hist = new Array(histLength).fill(0);
+  for (const s of present) {
+    (s.hist ?? []).forEach((c, i) => {
+      hist[i] += c;
+    });
+  }
   return {
     count,
     best: round(Math.min(...present.map((s) => s.best))),
     avg: round(present.reduce((sum, s) => sum + s.avg * s.count, 0) / count),
+    hist,
     p50: mergedPercentile(
       50,
       present.map((s) => s.p50)

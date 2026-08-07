@@ -10,13 +10,26 @@
 import { describe, expect, test } from 'vitest';
 import {
   type BenchRttSummary,
+  histogramRttSamples,
   mergeRttSummaries,
+  RTT_HIST_EDGES_MS,
   RTT_INDEX_BUCKETS,
   RTT_SIZE_BUCKETS,
   rttIndexBucket,
   rttSizeBucket,
   summarizeRttSamples,
 } from '../../../workbench/example/workflows/97_bench_rtt';
+
+/** Histogram with `count` in the bin holding `value` and zeros elsewhere. */
+function histWith(value: number, count = 1): number[] {
+  const hist = new Array(RTT_HIST_EDGES_MS.length + 1).fill(0);
+  let bin = 0;
+  while (bin < RTT_HIST_EDGES_MS.length && value >= RTT_HIST_EDGES_MS[bin]) {
+    bin++;
+  }
+  hist[bin] = count;
+  return hist;
+}
 
 describe('rttIndexBucket', () => {
   test('boundaries', () => {
@@ -54,6 +67,25 @@ describe('rttSizeBucket', () => {
   });
 });
 
+describe('histogramRttSamples', () => {
+  test('bins are [prev edge, edge), first bin is <1ms, last is 5000+', () => {
+    expect(histogramRttSamples([0, 0.5])[0]).toBe(2);
+    // A sample exactly on an edge lands in the bin the edge opens.
+    const atEdge = histogramRttSamples([1]);
+    expect(atEdge[0]).toBe(0);
+    expect(atEdge[1]).toBe(1);
+    const overflow = histogramRttSamples([5000, 60000]);
+    expect(overflow[RTT_HIST_EDGES_MS.length]).toBe(2);
+  });
+
+  test('counts sum to the sample count', () => {
+    const samples = [0, 1, 3, 7, 59, 128, 438, 1229, 9999];
+    const hist = histogramRttSamples(samples);
+    expect(hist).toHaveLength(RTT_HIST_EDGES_MS.length + 1);
+    expect(hist.reduce((a, b) => a + b, 0)).toBe(samples.length);
+  });
+});
+
 describe('summarizeRttSamples', () => {
   test('returns undefined for an empty bucket', () => {
     expect(summarizeRttSamples([])).toBeUndefined();
@@ -64,6 +96,7 @@ describe('summarizeRttSamples', () => {
       count: 1,
       best: 7,
       avg: 7,
+      hist: histWith(7),
       p50: 7,
       p75: 7,
       p90: 7,
@@ -80,6 +113,7 @@ describe('summarizeRttSamples', () => {
       count: 100,
       best: 1,
       avg: 50.5,
+      hist: histogramRttSamples(samples),
       p50: 50,
       p75: 75,
       p90: 90,
@@ -99,6 +133,7 @@ describe('mergeRttSummaries', () => {
     count: 10,
     best: 1,
     avg: 5,
+    hist: histWith(5, 10),
     p50: 5,
     p75: 6,
     p90: 8,
@@ -124,6 +159,18 @@ describe('mergeRttSummaries', () => {
     expect(merged?.count).toBe(40);
     expect(merged?.best).toBe(1);
     expect(merged?.avg).toBe(4); // (10*10 + 2*30) / 40
+  });
+
+  test('histograms merge by elementwise summation (exact)', () => {
+    const merged = mergeRttSummaries([
+      summary({ count: 10, hist: histWith(5, 10) }),
+      summary({ count: 30, hist: histWith(128, 30) }),
+    ]);
+    const expected = histWith(5, 10);
+    const bin128 = histWith(128, 30);
+    for (let i = 0; i < expected.length; i++) expected[i] += bin128[i];
+    expect(merged?.hist).toEqual(expected);
+    expect(merged?.hist.reduce((a, b) => a + b, 0)).toBe(40);
   });
 
   test('percentiles merge as percentile-of-percentiles', () => {

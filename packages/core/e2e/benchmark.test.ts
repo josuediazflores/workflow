@@ -62,18 +62,23 @@
  *          rather than `readAt` on the first. Measured for two payload shapes
  *          (raw text vs AI-SDK-style structured deltas) so the SO delta between
  *          them isolates serialization cost.
- * - CRTT  (chunk round-trip time): per-chunk write->read RTT for the same
+ * - CRTT  (chunk round-trip time): per-chunk write->read latency for the same
  *          paced LLM-shaped stream, measured on the deployment by
- *          `benchCrttWorkflow`. Every delta embeds `{ seq, writtenAt }` (the SL
- *          scenario's payload-embedded-timestamp trick applied to every chunk)
- *          and the reader stamps each chunk's arrival. Samples are aggregated
- *          INSIDE the reader step into chunk-index buckets (seq 0 / 1-20 /
- *          21-100 / 101+) and chunk-size buckets (<=256B / 256B-4KB / >4KB, fed
- *          by a size-sweep variant whose deltas are padded in rotation to
- *          ~100B/1KB/10KB), and the runner merges the per-iteration summaries
- *          (exact best/avg/count; percentile-of-percentiles for p50-p99 — see
- *          mergeRttSummaries). No targets yet: targets come from
- *          provider-cadence measurement, separately.
+ *          `benchCrttWorkflow`. The "round trip" is deployment -> stream
+ *          backend -> reader on the same deployment (which is what keeps both
+ *          timestamps on one clock domain) — not an echo back to the writer.
+ *          Every delta embeds `{ seq, writtenAt }` (the SL scenario's
+ *          payload-embedded-timestamp trick applied to every chunk) and the
+ *          reader stamps each chunk's arrival. Samples are aggregated INSIDE
+ *          the reader step into chunk-index buckets (seq 0 / 1-20 / 21-100 /
+ *          101+), chunk-size buckets (<=256B / 256B-4KB / >4KB, fed by a
+ *          size-sweep variant whose deltas are padded in rotation to
+ *          ~100B/1KB/10KB), and a fixed log-bin histogram per bucket. The
+ *          runner merges the per-iteration summaries (exact best/avg/count and
+ *          histograms; percentile-of-percentiles for p50-p99 — see
+ *          mergeRttSummaries); the PR comment renders the histograms as a
+ *          collapsed distribution-diff section, like STSO's. No targets yet:
+ *          targets come from provider-cadence measurement, separately.
  *
  * Scenarios (defined in workbench/example/workflows/97_bench.ts):
  *
@@ -110,6 +115,7 @@ import { getTrustedSourcesHeaders } from '../../../scripts/trusted-sources-heade
 import {
   type BenchRttSummary,
   mergeRttSummaries,
+  RTT_HIST_EDGES_MS,
   RTT_INDEX_BUCKETS,
   RTT_SIZE_BUCKETS,
 } from '../../../workbench/example/workflows/97_bench_rtt';
@@ -611,6 +617,11 @@ interface MetricStats {
    * comment diffs the whole STSO distribution against `main`, and
    * percentiles alone hide *how many* samples moved and by how much. */
   raw: number[];
+  /** Fixed-bin histogram of the samples, for rows whose raw samples never
+   * reach this process (CRTT: aggregation happens in the reader step on the
+   * deployment). Fixed shared edges make the PR comment's distribution diff
+   * against `main` exact — the renderer only diffs matching-edge rows. */
+  hist?: { edgesMs: number[]; counts: number[] };
 }
 
 interface MetricTargets {
@@ -672,9 +683,12 @@ function recordMetric(
  * Records one CRTT bucket row from per-iteration summaries. Unlike
  * recordMetric there are no raw samples in this process — the reader step
  * aggregated them on the deployment — so the row is the mergeRttSummaries
- * merge: exact count/best/avg, percentile-of-percentiles for p50-p99.
- * `samples` is the total chunk count in the bucket across iterations. No
- * targets yet (see the CRTT header note), so no 🔴 marks render.
+ * merge: exact count/best/avg/histogram, percentile-of-percentiles for
+ * p50-p99. `samples` is the total chunk count in the bucket across
+ * iterations. The merged fixed-bin histogram rides along so the PR comment
+ * can render an exact distribution diff vs `main` (the table percentiles are
+ * approximations; the histogram is not). No targets yet (see the CRTT header
+ * note), so no 🔴 marks render.
  */
 function recordCrttMetric(
   scenario: string,
@@ -694,6 +708,7 @@ function recordCrttMetric(
     p99: merged.p99,
     samples: merged.count,
     raw: [],
+    hist: { edgesMs: RTT_HIST_EDGES_MS, counts: merged.hist },
   });
 }
 

@@ -29,10 +29,13 @@
 //   SO setup (paced writer + parallel reader, same deployment, so no clock
 //   skew beyond intra-Vercel NTP bounds) but embedding `{ seq, writtenAt }` in
 //   every chunk — the SL scenario's payload-embedded-timestamp trick applied
-//   to the whole stream. The reader stamps each chunk's arrival, computes
+//   to the whole stream. The "round trip" is deployment -> stream backend ->
+//   reader on the same deployment (one clock domain), not an echo back to the
+//   writer. The reader stamps each chunk's arrival, computes
 //   `rtt = Date.now() - chunk.writtenAt`, and aggregates on the deployment
 //   into chunk-index and chunk-size buckets (see 97_bench_rtt.ts), returning
-//   compact per-bucket summaries instead of hundreds of raw samples.
+//   compact per-bucket summaries — percentiles plus fixed log-bin histograms
+//   — instead of hundreds of raw samples.
 
 import { createHook, getWorkflowMetadata, getWritable } from 'workflow';
 import { getRun } from 'workflow/api';
@@ -599,10 +602,12 @@ async function crttWriterStep(
  * dedicated namespaced stream, reader-ready barrier), but the measurement is
  * per chunk rather than per stream: every delta embeds `{ seq, writtenAt }`
  * (the SL scenario's payload-embedded-timestamp trick applied to all chunks),
- * and the reader computes each chunk's write->read RTT on arrival. The reader
- * aggregates the samples on the deployment into chunk-index buckets and
- * chunk-size buckets (see 97_bench_rtt.ts) and the workflow returns those
- * compact summaries. The `'llm'` variant streams the same LLM-shaped deltas as
+ * and the reader computes each chunk's write->read RTT on arrival (the "round
+ * trip" being deployment -> stream backend -> co-located reader, not an echo
+ * back to the writer). The reader aggregates the samples on the deployment
+ * into chunk-index buckets and chunk-size buckets (see 97_bench_rtt.ts) and
+ * the workflow returns those compact summaries, each carrying a fixed
+ * log-bin histogram so distributions merge and diff exactly across runs. The `'llm'` variant streams the same LLM-shaped deltas as
  * SO (index bucketing on pure token-shaped traffic); the `'sweep'` variant
  * pads deltas in rotation to ~100B/1KB/10KB so RTT can be compared across
  * chunk sizes.
