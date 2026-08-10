@@ -76,9 +76,11 @@
  *          ~100B/1KB/10KB), and a fixed log-bin histogram per bucket. The
  *          runner merges the per-iteration summaries (exact best/avg/count and
  *          histograms; percentile-of-percentiles for p50-p99 — see
- *          mergeRttSummaries); the PR comment renders the histograms as a
- *          collapsed distribution-diff section, like STSO's. No targets yet:
- *          targets come from provider-cadence measurement, separately.
+ *          mergeRttSummaries). Only the two per-variant pooled rows land in
+ *          the PR comment's main table; the per-bucket rows are flagged
+ *          `detail` and render as a one-line-per-bucket sparkline matrix in a
+ *          collapsed drill-down section instead. No targets yet: targets come
+ *          from provider-cadence measurement, separately.
  *
  * Scenarios (defined in workbench/example/workflows/97_bench.ts):
  *
@@ -622,6 +624,13 @@ interface MetricStats {
    * deployment). Fixed shared edges make the PR comment's distribution diff
    * against `main` exact — the renderer only diffs matching-edge rows. */
   hist?: { edgesMs: number[]; counts: number[] };
+  /** Drill-down rows (e.g. CRTT per-bucket splits): kept out of the PR
+   * comment's main results table and rendered in a collapsed section. */
+  detail?: boolean;
+  /** Short group/bucket labels for drill-down rendering (CRTT: variant and
+   * index/size bucket). */
+  group?: string;
+  bucket?: string;
 }
 
 interface MetricTargets {
@@ -680,19 +689,25 @@ function recordMetric(
 }
 
 /**
- * Records one CRTT bucket row from per-iteration summaries. Unlike
- * recordMetric there are no raw samples in this process — the reader step
- * aggregated them on the deployment — so the row is the mergeRttSummaries
- * merge: exact count/best/avg/histogram, percentile-of-percentiles for
- * p50-p99. `samples` is the total chunk count in the bucket across
- * iterations. The merged fixed-bin histogram rides along so the PR comment
- * can render an exact distribution diff vs `main` (the table percentiles are
- * approximations; the histogram is not). No targets yet (see the CRTT header
- * note), so no 🔴 marks render.
+ * Records one CRTT row from per-iteration summaries. Unlike recordMetric
+ * there are no raw samples in this process — the reader step aggregated them
+ * on the deployment — so the row is the mergeRttSummaries merge: exact
+ * count/best/avg/histogram, percentile-of-percentiles for p50-p99. `samples`
+ * is the total chunk count across iterations. The merged fixed-bin histogram
+ * rides along for the PR comment's sparkline drill-down (exact vs `main`,
+ * where the percentiles are approximations). Rows with `detail` stay out of
+ * the main results table and only appear in that drill-down — one variant
+ * gets one headline row, not one row per bucket. No targets yet (see the
+ * CRTT header note), so no 🔴 marks render.
  */
 function recordCrttMetric(
   scenario: string,
-  summaries: readonly (BenchRttSummary | undefined)[]
+  summaries: readonly (BenchRttSummary | undefined)[],
+  {
+    group,
+    bucket,
+    detail = false,
+  }: { group: string; bucket: string; detail?: boolean }
 ) {
   const merged = mergeRttSummaries(summaries);
   if (!merged) return;
@@ -709,6 +724,9 @@ function recordCrttMetric(
     samples: merged.count,
     raw: [],
     hist: { edgesMs: RTT_HIST_EDGES_MS, counts: merged.hist },
+    detail: detail || undefined,
+    group,
+    bucket,
   });
 }
 
@@ -736,8 +754,9 @@ const SCENARIO_STREAM_LATENCY = 'stream latency';
 // and re-baseline on the next `main` run.
 const SCENARIO_STREAM_OVERHEAD_TEXT = 'stream overhead (text)';
 const SCENARIO_STREAM_OVERHEAD_STRUCTURED = 'stream overhead (structured)';
-// CRTT scenario labels. Row scenario names are `chunk RTT llm (<bucket>)` /
-// `chunk RTT sweep (<bucket>)` — all new baseline keys, so nothing diffs
+// CRTT scenario labels, doubling as the headline rows' scenario keys; the
+// per-bucket detail rows are keyed `chunk RTT llm (<bucket>)` /
+// `chunk RTT sweep (<bucket>)`. All new baseline keys, so nothing diffs
 // against pre-existing SL/SO baselines (their scenarios and payloads are
 // untouched) and the CRTT deltas stay blank until `main` produces them.
 const SCENARIO_CHUNK_RTT_LLM = 'chunk RTT (llm)';
@@ -940,15 +959,19 @@ describe('workflow benchmarks', () => {
       () => runCrttIteration('llm')
     );
     // The pooled row is the headline (per-chunk RTT averaged independent of
-    // chunk size); the index-bucket rows split it by position in the stream.
+    // chunk size) and the only llm row in the main table; the index-bucket
+    // rows split it by position in the stream and render as sparkline lines
+    // in the collapsed drill-down.
     recordCrttMetric(
-      'chunk RTT llm (all)',
-      results.map((r) => r.crtt.all)
+      SCENARIO_CHUNK_RTT_LLM,
+      results.map((r) => r.crtt.all),
+      { group: 'llm', bucket: 'all' }
     );
     for (const bucket of RTT_INDEX_BUCKETS) {
       recordCrttMetric(
         `chunk RTT llm (${bucket})`,
-        results.map((r) => r.crtt.byIndex[bucket])
+        results.map((r) => r.crtt.byIndex[bucket]),
+        { group: 'llm', bucket, detail: true }
       );
     }
   });
@@ -963,15 +986,17 @@ describe('workflow benchmarks', () => {
         () => runCrttIteration('sweep')
       );
       recordCrttMetric(
-        'chunk RTT sweep (all)',
-        results.map((r) => r.crtt.all)
+        SCENARIO_CHUNK_RTT_SWEEP,
+        results.map((r) => r.crtt.all),
+        { group: 'sweep', bucket: 'all' }
       );
       // Size buckets only from the sweep variant: the llm-shaped deltas all
       // land in the smallest bucket, so bucketing them by size says nothing.
       for (const bucket of RTT_SIZE_BUCKETS) {
         recordCrttMetric(
           `chunk RTT sweep (${bucket})`,
-          results.map((r) => r.crtt.bySize[bucket])
+          results.map((r) => r.crtt.bySize[bucket]),
+          { group: 'sweep', bucket, detail: true }
         );
       }
     }

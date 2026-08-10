@@ -55,7 +55,7 @@ const METRIC_LABELS = {
   crtt: {
     name: 'CRTT',
     description:
-      'chunk round-trip time (per-chunk write → read latency; the "round trip" is deployment → stream backend → reader on the same deployment — same clock domain — not an echo back to the writer; aggregated in the reader step, so cross-iteration p50-p99 are percentile-of-percentiles while best/avg and the histograms are exact)',
+      'chunk round-trip time (per-chunk write → read latency; the "round trip" is deployment → stream backend → reader on the same deployment — one clock domain — not an echo back to the writer)',
   },
 };
 const METRIC_ORDER = ['ttfs', 'stso', 'wo', 'sl', 'so', 'crtt'];
@@ -145,7 +145,7 @@ function stripRawSamples(entries) {
     results: (entry.results ?? []).map((result) => ({
       ...result,
       metrics: (result.metrics ?? []).map(
-        ({ raw, baselineRaw, hist, baselineHist, ...row }) => row
+        ({ raw, baselineRaw, hist, ...row }) => row
       ),
     })),
   }));
@@ -217,9 +217,10 @@ const BASELINE_FIELDS = [
   { annotation: 'baselineP75', from: (base) => base.p75 },
   { annotation: 'baselineP90', from: (base) => base.p90 },
   { annotation: 'baselineP99', from: (base) => base.p99 },
-  // Not rendered in the table (there is no Avg column), but the CRTT
-  // distribution section headlines its exact avg with a vs-main delta.
+  // Not rendered in the main table (no Avg/P50 columns there), but the CRTT
+  // drill-down matrix shows vs-main deltas on both (avg deltas are exact).
   { annotation: 'baselineAvg', from: (base) => base.avg },
+  { annotation: 'baselineP50', from: (base) => base.p50 },
 ];
 
 export function annotateWithBaseline(results, baseline) {
@@ -245,16 +246,6 @@ export function annotateWithBaseline(results, baseline) {
     // histogram diff below the table — kept separate from BASELINE_FIELDS
     // since it's an array, not a numeric percentile.
     if (Array.isArray(base.raw)) annotated.baselineRaw = base.raw;
-    // Fixed-bin histograms drive the CRTT distribution diff. Only annotate
-    // when the bin edges match exactly — counts over different edges cannot
-    // be diffed, and edges may change across bench versions.
-    if (
-      Array.isArray(base.hist?.counts) &&
-      Array.isArray(row.hist?.counts) &&
-      JSON.stringify(base.hist.edgesMs) === JSON.stringify(row.hist.edgesMs)
-    ) {
-      annotated.baselineHist = base.hist;
-    }
     return annotated;
   };
   return results.map((result) => ({
@@ -506,106 +497,106 @@ function renderStsoDiffSection(result) {
 }
 
 // ============================================================================
-// CRTT distribution diff (fixed log-bin histograms, vs main)
+// CRTT drill-down (per-bucket sparkline matrix, vs main)
 // ============================================================================
 
-/** Bucket label for fixed-edge histogram bin `i`: `<e0` for the first bin,
- * `e(n-1)+` for the overflow bin, `a-b` in between. */
-function histBinLabel(edges, i) {
-  if (i === 0) return `<${edges[0]}`;
-  if (i >= edges.length) return `${edges[edges.length - 1]}+`;
-  return `${edges[i - 1]}-${edges[i]}`;
-}
+const SPARK_LEVELS = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
 
-/** (label, main count, this-run count) triples for a fixed-edge histogram
- * pair, skipping bins empty on both sides (log bins cover µs-to-seconds, so
- * most rows only occupy a handful of them). */
-function nonEmptyHistBuckets(edges, curCounts, baseCounts) {
-  const buckets = [];
-  const bins = Math.max(curCounts.length, baseCounts.length);
-  for (let i = 0; i < bins; i++) {
-    const cur = curCounts[i] ?? 0;
-    const base = baseCounts[i] ?? 0;
-    if (cur === 0 && base === 0) continue;
-    buckets.push({ label: histBinLabel(edges, i), base, cur });
-  }
-  return buckets;
-}
-
-/** Renders one CRTT row's average line and histogram diff (this run vs
- * main). Unlike the STSO diff there are no raw samples to re-bin — the
- * reader step aggregated into fixed log bins on the deployment — which is
- * exactly what makes the diff exact: identical edges on both sides. */
-function renderCrttRowDiff(row) {
-  const selfDiff =
-    !Array.isArray(row.baselineHist?.counts) ||
-    typeof row.baselineAvg !== 'number';
-  const baselineCounts = selfDiff ? row.hist.counts : row.baselineHist.counts;
-  const buckets = nonEmptyHistBuckets(
-    row.hist.edgesMs,
-    row.hist.counts,
-    baselineCounts
-  );
-
-  // Avgs come rounded to 0.1ms from the bench, but round here too so a
-  // baseline from any producer can't leak float noise into the headline.
-  const fmtAvg = (v) => Math.round(v * 10) / 10;
-  const lines = ['', `_${row.scenario}_`, ''];
-  if (selfDiff) {
-    lines.push(`Avg RTT: ${fmtAvg(row.avg)}ms over ${row.samples} chunks`, '');
-  } else {
-    // The avg is exact on both sides (count-weighted merge), so it is the
-    // honest headline delta for a distribution whose table percentiles are
-    // approximations.
-    const delta = row.avg - row.baselineAvg;
-    const pct =
-      row.baselineAvg > 0
-        ? `, ${formatDeltaValue((delta / row.baselineAvg) * 100)}%`
-        : '';
-    lines.push(
-      `Avg RTT: main ${fmtAvg(row.baselineAvg)}ms → this run ${fmtAvg(row.avg)}ms (Δ ${formatDeltaValue(delta, 'ms')}${pct})`,
-      ''
-    );
-  }
-  if (buckets.length > 0) {
-    lines.push(
-      renderHistogramBarChart(buckets, { selfDiff, selfLabel: 'chunks' })
-    );
-  }
-  return lines.join('\n');
+/** One-character-per-bin sparkline over fixed histogram counts, normalized to
+ * the row's own max so every bucket's *shape* is readable regardless of its
+ * sample count. Empty bins render as `·` so the fixed log axis stays visible
+ * and the occupied bins' *position* on it (fast vs slow) is comparable across
+ * lines. */
+function sparkline(counts) {
+  const max = Math.max(1, ...counts);
+  return counts
+    .map((c) =>
+      c === 0
+        ? '·'
+        : SPARK_LEVELS[
+            Math.min(
+              SPARK_LEVELS.length - 1,
+              Math.floor((c / max) * SPARK_LEVELS.length)
+            )
+          ]
+    )
+    .join('');
 }
 
 /**
- * Renders a per-bucket histogram diff against `main` for every CRTT row that
- * carries a fixed-bin histogram — the CRTT counterpart of the STSO
- * distribution section. Percentile columns hide both the shape (a delivery
- * cadence shows up as a hump, not a number) and *how many* chunks moved;
- * these histograms show both, and — because the bins are fixed and merged by
- * summation — they are exact where the table's cross-iteration percentiles
- * are percentile-of-percentiles approximations.
+ * Renders every CRTT row (headline + `detail` buckets) as ONE line each:
+ * a sparkline of the fixed log-bin RTT histogram plus avg/p50/p90/p99, with
+ * plain vs-main percentages when a baseline exists. This is the whole CRTT
+ * drill-down — the buckets differ by numbers, not by shape, so a matrix is
+ * far denser than one chart per bucket, and the sparklines still show each
+ * shape (e.g. a delivery-cadence hump).
  *
+ * The avg deltas are exact (count-weighted merges on both sides); p50-p99
+ * are cross-iteration percentile-of-percentiles, like the main table.
  * Collapsed by default, like the STSO section: a drill-down, not the
  * headline.
  */
-function renderCrttDiffSection(result) {
+function renderCrttMatrixSection(result) {
   const rows = (result.metrics ?? []).filter(
     (row) => row.metric === 'crtt' && Array.isArray(row.hist?.counts)
   );
   if (rows.length === 0) return '';
-  const anyBaseline = rows.some((row) =>
-    Array.isArray(row.baselineHist?.counts)
+  const anyBaseline = rows.some((row) => typeof row.baselineAvg === 'number');
+
+  const round1 = (v) => Math.round(v * 10) / 10;
+  const pct = (cur, base) => {
+    if (typeof cur !== 'number' || typeof base !== 'number' || base <= 0) {
+      return '';
+    }
+    const p = ((cur - base) / base) * 100;
+    if (Math.abs(p) < 0.5) return ' (±0%)';
+    return ` (${p > 0 ? '+' : ''}${Math.round(p)}%)`;
+  };
+  const cells = (row) => [
+    [row.group ?? '', row.bucket ?? row.scenario].join(' ').trim(),
+    sparkline(row.hist.counts),
+    `${round1(row.avg)}${pct(row.avg, row.baselineAvg)}`,
+    `${formatMs(row.p50)}${pct(row.p50, row.baselineP50)}`,
+    `${formatMs(row.p90)}${pct(row.p90, row.baselineP90)}`,
+    `${formatMs(row.p99)}${pct(row.p99, row.baselineP99)}`,
+    String(row.samples),
+  ];
+  const header = ['bucket', 'RTT 1ms→5s+', 'avg', 'p50', 'p90', 'p99', 'n'];
+  const table = [header, ...rows.map(cells)];
+  const widths = header.map((_, col) =>
+    Math.max(...table.map((line) => line[col].length))
   );
+  const renderLine = (line) =>
+    line
+      .map((cell, col) =>
+        // Left-align the label and sparkline columns, right-align numbers.
+        col <= 1 ? cell.padEnd(widths[col]) : cell.padStart(widths[col])
+      )
+      .join('  ')
+      .trimEnd();
+
+  const lines = ['```', renderLine(header)];
+  let previousGroup = rows[0]?.group;
+  for (const row of rows) {
+    // Blank line between variants (llm vs sweep) so the groups read apart.
+    if (row.group !== previousGroup) lines.push('');
+    previousGroup = row.group;
+    lines.push(renderLine(cells(row)));
+  }
+  lines.push('```');
+
   return [
     '',
     '<details>',
-    `<summary>📈 CRTT distribution${anyBaseline ? ' vs main' : ''} (per-chunk RTT histograms)</summary>`,
+    `<summary>📈 CRTT drill-down${anyBaseline ? ' vs main' : ''} (per-bucket RTT distributions)</summary>`,
     '',
     ...(anyBaseline
       ? []
       : [
-          "<sub>No `main` baseline with histograms yet — showing this run's distributions on their own; the diffs appear once a run on `main` has recorded them.</sub>",
+          '<sub>No `main` baseline yet — percentages appear once a run on `main` has recorded CRTT.</sub>',
+          '',
         ]),
-    ...rows.map(renderCrttRowDiff),
+    lines.join('\n'),
     '',
     '</details>',
   ].join('\n');
@@ -665,9 +656,11 @@ function renderResultTable(result) {
     '| Metric | Scenario | Best (ms) | P75 (ms) | P90 (ms) | P99 (ms) | Samples |',
     '|--------|----------|----------:|---------:|---------:|---------:|--------:|',
   ];
-  const rows = [...result.metrics].sort(
-    (a, b) => metricSortKey(a) - metricSortKey(b)
-  );
+  // Drill-down rows (e.g. CRTT's per-bucket splits) stay out of the headline
+  // table; they render in their own collapsed section.
+  const rows = result.metrics
+    .filter((row) => !row.detail)
+    .sort((a, b) => metricSortKey(a) - metricSortKey(b));
   for (const row of rows) {
     const label = METRIC_LABELS[row.metric];
     // Abbreviations only — the definitions live in the comment footer.
@@ -706,7 +699,7 @@ function renderEntry(entry, { heading }) {
     // skipped for the collapsed history entries.
     const stsoDiff = renderStsoDiffSection(result);
     if (stsoDiff) lines.push(stsoDiff, '');
-    const crttDiff = renderCrttDiffSection(result);
+    const crttDiff = renderCrttMatrixSection(result);
     if (crttDiff) lines.push(crttDiff, '');
   }
   return lines.join('\n');
@@ -781,7 +774,7 @@ function renderFooter(entries) {
       : []),
     ...(hasCrttDistribution
       ? [
-          "<sub>The collapsed **CRTT distribution** section buckets every chunk's write→read latency into fixed log-scale bins (1-2-5 series), aggregated inside the reader step on the deployment and merged by summation — so unlike the table's cross-iteration CRTT percentiles (percentile-of-percentiles), the histograms and the avg line are exact. Bars overlay `main` and this run the same way as the STSO section.</sub>",
+          "<sub>The collapsed **CRTT drill-down** shows one line per chunk bucket: a sparkline of that bucket's RTT distribution over fixed log-scale bins (1-2-5 series, <1ms on the left to ≥5s on the right, normalized per line, `·` = empty bin) plus avg/p50/p90/p99. RTTs are aggregated inside the reader step on the deployment; the histograms and avgs merge exactly across iterations and runs, while p50-p99 are percentile-of-percentiles across iterations.</sub>",
           '',
         ]
       : []),

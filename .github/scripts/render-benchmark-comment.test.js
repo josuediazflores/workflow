@@ -500,118 +500,116 @@ function crttHist(entries) {
   return counts;
 }
 
-function crttResult({ avg, hist, edges = CRTT_EDGES }) {
+function crttResult({ avg = 120, detailAvg = 130, hist }) {
+  const row = (scenario, overrides) => ({
+    metric: 'crtt',
+    scenario,
+    unit: 'ms',
+    best: 59,
+    avg,
+    p50: 128,
+    p75: 188,
+    p90: 438,
+    p99: 1229,
+    samples: hist.reduce((a, b) => a + b, 0),
+    raw: [],
+    hist: { edgesMs: CRTT_EDGES, counts: hist },
+    ...overrides,
+  });
   return sampleResult({
     scenarios: [
       { name: 'chunk RTT (llm)', description: 'self-timestamping chunks' },
     ],
     metrics: [
-      {
-        metric: 'crtt',
-        scenario: 'chunk RTT llm (all)',
-        unit: 'ms',
-        best: 59,
-        avg,
-        p50: 128,
-        p75: 188,
-        p90: 438,
-        p99: 1229,
-        samples: hist.reduce((a, b) => a + b, 0),
-        raw: [],
-        hist: { edgesMs: edges, counts: hist },
-      },
+      row('chunk RTT (llm)', { group: 'llm', bucket: 'all' }),
+      row('chunk RTT llm (seq 0)', {
+        group: 'llm',
+        bucket: 'seq 0',
+        detail: true,
+        avg: detailAvg,
+      }),
+      row('chunk RTT (size sweep)', { group: 'sweep', bucket: 'all' }),
     ],
   });
 }
 
-test('renders the CRTT histogram diff from fixed log bins', async () => {
+test('renders the CRTT drill-down as a sparkline matrix', async () => {
   const { renderComment, extractHistory } = await loadModule();
+  const hist = crttHist([
+    [59, 1400],
+    [128, 1500],
+    [438, 100],
+  ]);
   const body = renderComment({
     status: 'completed',
-    // 100 chunks move from the 100-200ms bin down to 50-100ms vs main.
-    results: [
-      crttResult({
-        avg: 120,
-        hist: crttHist([
-          [59, 1400],
-          [128, 1500],
-          [438, 100],
-        ]),
-      }),
-    ],
-    baseline: [
-      crttResult({
-        avg: 150,
-        hist: crttHist([
-          [59, 1300],
-          [128, 1600],
-          [438, 100],
-        ]),
-      }),
-    ],
+    results: [crttResult({ avg: 120, detailAvg: 130, hist })],
+    baseline: [crttResult({ avg: 150, detailAvg: 130, hist })],
     history: [],
     commit: 'abcdef1234567890',
   });
 
-  // Collapsed by default, like the STSO section.
+  // Only headline rows reach the main table; detail rows do not.
+  assert.match(body, /\| \*\*CRTT\*\* \| chunk RTT \(llm\) \|/);
+  assert.match(body, /\| \*\*CRTT\*\* \| chunk RTT \(size sweep\) \|/);
+  assert.doesNotMatch(body, /\| \*\*CRTT\*\* \| chunk RTT llm \(seq 0\) \|/);
+
+  // Collapsed drill-down: one line per bucket with sparkline + stats.
   assert.match(
     body,
-    /<details>\n<summary>📈 CRTT distribution vs main \(per-chunk RTT histograms\)<\/summary>/
+    /<details>\n<summary>📈 CRTT drill-down vs main \(per-bucket RTT distributions\)<\/summary>/
   );
-  assert.match(body, /_chunk RTT llm \(all\)_/);
-  // Exact avg headline with vs-main delta.
-  assert.match(body, /Avg RTT: main 150ms → this run 120ms \(Δ -30ms, -20%\)/);
-  // Fixed log-bin labels with per-bin main/this counts and deltas.
-  assert.match(body, /^ *50-100 ms .*main 1300 +this 1400 +\+100$/m);
-  assert.match(body, /^ *100-200 ms .*main 1600 +this 1500 +-100$/m);
-  assert.match(body, /^ *200-500 ms .*main +100 +this +100 +\+0$/m);
-  // Empty bins are skipped entirely.
-  assert.doesNotMatch(body, /^ *<1 ms/m);
-  assert.doesNotMatch(body, /^ *5000\+ ms/m);
-  // Footer smallprint explains the section.
-  assert.match(
-    body,
-    /<sub>The collapsed \*\*CRTT distribution\*\* section buckets every chunk's/
-  );
+  assert.match(body, /bucket +RTT 1ms→5s\+ +avg +p50 +p90 +p99 +n/);
+  // Sparkline over the fixed log bins: the dominant bin renders as █, with
+  // · keeping empty bins (the axis) visible.
+  assert.match(body, /llm all +·+[▁▂▃▄▅▆▇█]*█/);
+  assert.match(body, /llm seq 0 /);
+  assert.match(body, /sweep all /);
+  // Exact avg delta vs main; percentiles equal → ±0%.
+  assert.match(body, /120 \(-20%\)/);
+  assert.match(body, /128 \(±0%\)/);
+  // seq 0's avg matches its baseline → ±0%, not -20%.
+  assert.match(body, /llm seq 0 +.*130 \(±0%\)/);
+  // No per-bucket bar charts anymore — the matrix is the whole section.
+  assert.doesNotMatch(body, /Avg RTT:/);
+  assert.doesNotMatch(body, /chunks \d/);
+  // Footer smallprint explains the sparklines.
+  assert.match(body, /<sub>The collapsed \*\*CRTT drill-down\*\* shows one/);
   // Histograms are stripped from the embedded history data block, like raw
   // samples (the artifacts keep them; only the comment payload slims down).
   const history = extractHistory(body);
   const row = history[0].results[0].metrics[0];
   assert.strictEqual(row.hist, undefined);
-  assert.strictEqual(row.baselineHist, undefined);
   assert.strictEqual(row.baselineAvg, 150);
+  // Re-rendering from history keeps the table but drops the drill-down.
+  const rerendered = renderComment({
+    status: 'running',
+    results: [],
+    history,
+    commit: 'ffffff1234567890',
+  });
+  assert.match(rerendered, /\| \*\*CRTT\*\* \| chunk RTT \(llm\) \|/);
+  assert.doesNotMatch(rerendered, /CRTT drill-down/);
+  assert.doesNotMatch(rerendered, /chunk RTT llm \(seq 0\)/);
 });
 
-test('shows the CRTT distribution alone without a matching-edge baseline', async () => {
+test('shows the CRTT drill-down without deltas when main has no CRTT', async () => {
   const { renderComment } = await loadModule();
-  const run = crttResult({ avg: 120, hist: crttHist([[128, 3000]]) });
-  // Baseline recorded histograms over DIFFERENT edges (a future re-binning):
-  // counts over mismatched edges must not be diffed.
-  const baseline = crttResult({
-    avg: 150,
-    hist: crttHist([[128, 3000]]),
-    edges: [10, 100, 1000],
-  });
-  baseline.metrics[0].hist.counts = [0, 1500, 1500, 0];
-
   const body = renderComment({
     status: 'completed',
-    results: [run],
-    baseline: [baseline],
+    results: [crttResult({ hist: crttHist([[128, 3000]]) })],
     history: [],
     commit: 'abcdef1234567890',
   });
 
   assert.match(
     body,
-    /<summary>📈 CRTT distribution \(per-chunk RTT histograms\)<\/summary>/
+    /<summary>📈 CRTT drill-down \(per-bucket RTT distributions\)<\/summary>/
   );
-  assert.doesNotMatch(body, /CRTT distribution vs main/);
-  assert.match(body, /No `main` baseline with histograms yet/);
-  assert.match(body, /Avg RTT: 120ms over 3000 chunks/);
-  // Single-series rendering labels the counts as chunks.
-  assert.match(body, /^ *100-200 ms .*chunks 3000$/m);
-  assert.doesNotMatch(body, /this \d/);
+  assert.doesNotMatch(body, /CRTT drill-down vs main/);
+  assert.match(body, /No `main` baseline yet/);
+  // Stats render without percentage suffixes.
+  assert.match(body, /llm all +·+█·+ +120 +128 +438 +1229 +3000/);
+  assert.doesNotMatch(body, /%\)/);
 });
 
 test('renders inline and queue-hop STSO histogram diffs against main', async () => {
