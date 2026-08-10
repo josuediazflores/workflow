@@ -266,6 +266,8 @@ function parseJobInfo(filename) {
           'redis',
           'starter',
           'python',
+          'nest',
+          'tanstack',
         ].some((app) => p.startsWith(app))
     );
 
