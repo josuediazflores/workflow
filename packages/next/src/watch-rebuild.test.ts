@@ -200,7 +200,7 @@ export const allWorkflows = {} as const;
     ).resolves.toEqual({ kind: 'full' });
   });
 
-  test('rebuilds stale workflow notifications', async () => {
+  test('fully rebuilds byte-identical workflow notifications', async () => {
     const workflowFile = '/app/workflows/example.ts';
     const source = `export async function example() {
   'use workflow';
@@ -211,25 +211,21 @@ export const allWorkflows = {} as const;
       detectWorkflowPatterns
     );
 
-    const decision = await classifyRebuild({
-      discoveredEntries: {
-        discoveredSteps: new Set(),
-        discoveredWorkflows: new Set([workflowFile]),
-        discoveredSerdeFiles: new Set(),
-        discoveredFiles: new Set([workflowFile]),
-      },
-      files: [workflowFile],
-      inputFiles: [workflowFile],
-      parentHasChild: () => false,
-      readSnapshot: async () => snapshot,
-      sourceSnapshots: new Map([[workflowFile, snapshot]]),
-    });
-
-    expect(decision).toEqual({
-      kind: 'hot',
-      refreshStepRegistrations: false,
-      snapshots: new Map([[workflowFile, snapshot]]),
-    });
+    await expect(
+      classifyRebuild({
+        discoveredEntries: {
+          discoveredSteps: new Set(),
+          discoveredWorkflows: new Set([workflowFile]),
+          discoveredSerdeFiles: new Set(),
+          discoveredFiles: new Set([workflowFile]),
+        },
+        files: [workflowFile],
+        inputFiles: [workflowFile],
+        parentHasChild: () => false,
+        readSnapshot: async () => snapshot,
+        sourceSnapshots: new Map([[workflowFile, snapshot]]),
+      })
+    ).resolves.toEqual({ kind: 'full' });
   });
 
   test('rebuilds relevant files without snapshots', async () => {

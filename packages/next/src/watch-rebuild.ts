@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
 
 export interface DiscoveredEntriesLike {
@@ -12,6 +13,7 @@ export type ScheduledRebuild =
   | { kind: 'full' };
 
 export interface SourceSnapshot {
+  sourceHash: string;
   importSignature: string;
   definitionSignature: string;
   hasDirective: boolean;
@@ -214,6 +216,7 @@ export const createSourceSnapshotFromSource = (
   const patterns = detectWorkflowPatterns(sourceWithoutComments);
 
   return {
+    sourceHash: createHash('sha256').update(source).digest('base64url'),
     importSignature: extractImportSignature(sourceWithoutComments),
     definitionSignature: extractDefinitionSignature(sourceWithoutComments),
     hasDirective: patterns.hasDirective,
@@ -280,7 +283,7 @@ export const readSourceSnapshots = async ({
   return snapshots;
 };
 
-const didSourceSnapshotChange = (
+const didSourceStructureChange = (
   previousSnapshot: SourceSnapshot,
   nextSnapshot: SourceSnapshot
 ) =>
@@ -443,7 +446,10 @@ export const classifyRebuild = async ({
       }
       continue;
     }
-    if (didSourceSnapshotChange(previousSnapshot, nextSnapshot)) {
+    if (didSourceStructureChange(previousSnapshot, nextSnapshot)) {
+      return { kind: 'full' };
+    }
+    if (previousSnapshot.sourceHash === nextSnapshot.sourceHash) {
       return { kind: 'full' };
     }
     snapshots.set(file, nextSnapshot);
