@@ -11,15 +11,16 @@ import { describe, expect, test } from 'vitest';
 import {
   type BenchRttSummary,
   histogramRttSamples,
-  mergeProgressProfiles,
+  mergeMeanProfiles,
   mergeRttSummaries,
   progressProfile,
   RTT_HIST_EDGES_MS,
   RTT_INDEX_BUCKETS,
   RTT_PROGRESS_BINS,
-  RTT_SIZE_BUCKETS,
+  RTT_SIZE_BIN_EDGES_BYTES,
   rttIndexBucket,
-  rttSizeBucket,
+  rttSizeBin,
+  sizeProfile,
   summarizeRttSamples,
 } from '../../../workbench/example/workflows/97_bench_rtt';
 
@@ -77,33 +78,49 @@ describe('progressProfile', () => {
   });
 });
 
-describe('mergeProgressProfiles', () => {
+describe('mergeMeanProfiles', () => {
   test('returns undefined with no profiles and sums exactly otherwise', () => {
-    expect(mergeProgressProfiles([])).toBeUndefined();
-    expect(mergeProgressProfiles([undefined])).toBeUndefined();
+    expect(mergeMeanProfiles([])).toBeUndefined();
+    expect(mergeMeanProfiles([undefined])).toBeUndefined();
     const a = progressProfile(Array.from({ length: 10 }, () => 10));
     const b = progressProfile(Array.from({ length: 10 }, () => 30));
-    const merged = mergeProgressProfiles([a, undefined, b]);
+    const merged = mergeMeanProfiles([a, undefined, b]);
     expect(merged?.counts).toEqual(new Array(RTT_PROGRESS_BINS).fill(2));
     expect(merged?.totalMs).toEqual(new Array(RTT_PROGRESS_BINS).fill(40));
   });
 });
 
-describe('rttSizeBucket', () => {
-  test('boundaries', () => {
-    expect(rttSizeBucket(1)).toBe('<=256B');
-    expect(rttSizeBucket(256)).toBe('<=256B');
-    expect(rttSizeBucket(257)).toBe('256B-4KB');
-    expect(rttSizeBucket(4096)).toBe('256B-4KB');
-    expect(rttSizeBucket(4097)).toBe('>4KB');
+describe('sizeProfile', () => {
+  test('bins by serialized size with doubling edges', () => {
+    expect(rttSizeBin(100)).toBe(0);
+    expect(rttSizeBin(255)).toBe(0);
+    // A size exactly on an edge lands in the bin the edge opens.
+    expect(rttSizeBin(256)).toBe(1);
+    expect(rttSizeBin(1024)).toBe(3);
+    expect(rttSizeBin(8192)).toBe(RTT_SIZE_BIN_EDGES_BYTES.length);
+    expect(rttSizeBin(20000)).toBe(RTT_SIZE_BIN_EDGES_BYTES.length);
   });
 
-  test('the sweep pad sizes land in three distinct buckets', () => {
-    // Approximate serialized sizes of the sweep variant's rotation
-    // (~50B base chunk + pads of 64 / 1024 / 10240 chars).
-    expect(rttSizeBucket(120)).toBe(RTT_SIZE_BUCKETS[0]);
-    expect(rttSizeBucket(1080)).toBe(RTT_SIZE_BUCKETS[1]);
-    expect(rttSizeBucket(10300)).toBe(RTT_SIZE_BUCKETS[2]);
+  test('the sweep pad ladder occupies every size bin exactly once', () => {
+    // Approximate serialized sizes of the sweep rotation: ~60B base chunk
+    // plus pads of 100/340/700/1400/3000/6000/12000 chars.
+    const sizes = [160, 400, 760, 1460, 3060, 6060, 12060];
+    expect(new Set(sizes.map(rttSizeBin)).size).toBe(
+      RTT_SIZE_BIN_EDGES_BYTES.length + 1
+    );
+  });
+
+  test('accumulates count and total RTT per bin', () => {
+    const profile = sizeProfile([
+      { bytes: 160, rttMs: 10 },
+      { bytes: 200, rttMs: 20 },
+      { bytes: 12060, rttMs: 50 },
+    ]);
+    expect(profile.counts[0]).toBe(2);
+    expect(profile.totalMs[0]).toBe(30);
+    expect(profile.counts[RTT_SIZE_BIN_EDGES_BYTES.length]).toBe(1);
+    expect(profile.totalMs[RTT_SIZE_BIN_EDGES_BYTES.length]).toBe(50);
+    expect(profile.counts.reduce((a, b) => a + b, 0)).toBe(3);
   });
 });
 

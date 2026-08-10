@@ -532,7 +532,12 @@ function crttResult({ avg = 120, detailAvg = 130, hist }) {
         detail: true,
         avg: detailAvg,
       }),
-      row('chunk RTT (size sweep)', { group: 'sweep', bucket: 'all' }),
+      row('chunk RTT (size sweep)', {
+        group: 'sweep',
+        bucket: 'all',
+        // Last bin empty (null) — renders as a · gap in the size line.
+        sizeAvgMs: [118, 119, 121, 120, 124, 126, null],
+      }),
     ],
   });
 }
@@ -576,20 +581,26 @@ test('renders the CRTT drill-down as a sparkline matrix', async () => {
   // No per-bucket bar charts anymore — the matrix is the whole section.
   assert.doesNotMatch(body, /Avg RTT:/);
   assert.doesNotMatch(body, /chunks \d/);
-  // Progress profile: one line per variant that recorded one, min→max
-  // scaled bars with the ms range alongside.
+  // Profile lines: one per variant that recorded one, min→max scaled bars
+  // with the ms range alongside; empty bins render as · gaps.
   assert.match(body, /RTT over stream progress \(avg per tenth of stream/);
   assert.match(body, /llm {2}▁[▁▂▃▄▅▆▇█]{8}█ {2}110–135ms/);
+  assert.match(body, /RTT by chunk size \(avg per log size bin/);
+  assert.match(body, /sweep {2}▁[▁▂▃▄▅▆▇█]{4}█· {2}118–126ms/);
   // Footer smallprint explains the sparklines.
   assert.match(body, /<sub>The collapsed \*\*CRTT drill-down\*\* shows one/);
   // Histograms and progress profiles are stripped from the embedded history
   // data block, like raw samples (the artifacts keep them; only the comment
   // payload slims down).
   const history = extractHistory(body);
-  const row = history[0].results[0].metrics[0];
-  assert.strictEqual(row.hist, undefined);
-  assert.strictEqual(row.progressAvgMs, undefined);
-  assert.strictEqual(row.baselineAvg, 150);
+  const rows = history[0].results[0].metrics;
+  assert.strictEqual(rows[0].hist, undefined);
+  assert.strictEqual(rows[0].progressAvgMs, undefined);
+  assert.strictEqual(rows[0].baselineAvg, 150);
+  assert.strictEqual(
+    rows.find((r) => r.group === 'sweep').sizeAvgMs,
+    undefined
+  );
   // Re-rendering from history keeps the table but drops the drill-down.
   const rerendered = renderComment({
     status: 'running',

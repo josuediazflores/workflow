@@ -86,22 +86,23 @@ export function rttIndexBucket(seq: number): RttIndexBucket {
 // the profile line compact while still localizing a drift or a slow phase.
 export const RTT_PROGRESS_BINS = 10;
 
-/** Per-fraction-of-stream RTT totals: `totalMs[i]`/`counts[i]` is the mean
- * RTT of the i-th tenth of the stream. Fraction-based (not absolute seq), so
- * profiles are comparable across chunk counts; sums and counts merge exactly
- * across iterations and runs. */
-export interface BenchRttProgressProfile {
+/** A binned mean-RTT profile: `totalMs[i]`/`counts[i]` is the mean RTT of
+ * bin i. Used for both the stream-progress profile (bin = tenth of the
+ * stream) and the chunk-size profile (bin = log size range). Sums and counts
+ * merge exactly across iterations and runs. */
+export interface BenchRttMeanProfile {
   counts: number[];
   totalMs: number[];
 }
 
 /** Builds the progress profile from per-seq RTT samples (`rttBySeq[seq]` =
- * that chunk's RTT; sparse entries are skipped defensively). The trend this
- * surfaces — does per-chunk RTT rise as the stream grows? — is what fixed
- * index buckets cannot answer without arbitrary boundaries. */
+ * that chunk's RTT; sparse entries are skipped defensively). Fraction-based
+ * (not absolute seq), so profiles are comparable across chunk counts. The
+ * trend this surfaces — does per-chunk RTT rise as the stream grows? — is
+ * what fixed index buckets cannot answer without arbitrary boundaries. */
 export function progressProfile(
   rttBySeq: readonly (number | undefined)[]
-): BenchRttProgressProfile {
+): BenchRttMeanProfile {
   const counts = new Array(RTT_PROGRESS_BINS).fill(0);
   const totalMs = new Array(RTT_PROGRESS_BINS).fill(0);
   const n = rttBySeq.length;
@@ -118,18 +119,17 @@ export function progressProfile(
   return { counts, totalMs };
 }
 
-/** Merges progress profiles by summation — exact, like the histograms. */
-export function mergeProgressProfiles(
-  profiles: readonly (BenchRttProgressProfile | undefined)[]
-): BenchRttProgressProfile | undefined {
-  const present = profiles.filter(
-    (p): p is BenchRttProgressProfile => p != null
-  );
+/** Merges mean profiles by summation — exact, like the histograms. */
+export function mergeMeanProfiles(
+  profiles: readonly (BenchRttMeanProfile | undefined)[]
+): BenchRttMeanProfile | undefined {
+  const present = profiles.filter((p): p is BenchRttMeanProfile => p != null);
   if (present.length === 0) return undefined;
-  const counts = new Array(RTT_PROGRESS_BINS).fill(0);
-  const totalMs = new Array(RTT_PROGRESS_BINS).fill(0);
+  const bins = Math.max(...present.map((p) => p.counts.length));
+  const counts = new Array(bins).fill(0);
+  const totalMs = new Array(bins).fill(0);
   for (const p of present) {
-    for (let i = 0; i < RTT_PROGRESS_BINS; i++) {
+    for (let i = 0; i < bins; i++) {
       counts[i] += p.counts[i] ?? 0;
       totalMs[i] += p.totalMs[i] ?? 0;
     }
@@ -137,17 +137,39 @@ export function mergeProgressProfiles(
   return { counts, totalMs };
 }
 
-// Chunk-size buckets (approximate serialized bytes). The boundaries cleanly
-// separate the size-sweep scenario's three padded sizes (~100B / ~1KB / ~10KB)
-// while keeping the LLM-shaped deltas (a few tens of bytes) in the smallest
-// bucket.
-export const RTT_SIZE_BUCKETS = ['<=256B', '256B-4KB', '>4KB'] as const;
-export type RttSizeBucket = (typeof RTT_SIZE_BUCKETS)[number];
+// Chunk-size profile bins (approximate serialized bytes, doubling edges).
+// Bin i covers [edges[i-1], edges[i]), bin 0 everything below 256B, and the
+// last bin everything at/above 8KB. The size-sweep scenario's pad rotation
+// (see CRTT_SWEEP_PAD_LENGTHS in 97_bench.ts) puts one padded size in each
+// bin, so the mean-RTT-per-bin profile is a size→latency curve: flat means
+// chunk size doesn't matter, a knee localizes where it starts to.
+export const RTT_SIZE_BIN_EDGES_BYTES = [256, 512, 1024, 2048, 4096, 8192];
 
-export function rttSizeBucket(serializedBytes: number): RttSizeBucket {
-  if (serializedBytes <= 256) return '<=256B';
-  if (serializedBytes <= 4096) return '256B-4KB';
-  return '>4KB';
+/** Bin index into {@link RTT_SIZE_BIN_EDGES_BYTES} for a serialized size. */
+export function rttSizeBin(serializedBytes: number): number {
+  let bin = 0;
+  while (
+    bin < RTT_SIZE_BIN_EDGES_BYTES.length &&
+    serializedBytes >= RTT_SIZE_BIN_EDGES_BYTES[bin]
+  ) {
+    bin++;
+  }
+  return bin;
+}
+
+/** Builds the chunk-size profile from (serialized bytes, RTT) samples. */
+export function sizeProfile(
+  samples: readonly { bytes: number; rttMs: number }[]
+): BenchRttMeanProfile {
+  const bins = RTT_SIZE_BIN_EDGES_BYTES.length + 1;
+  const counts = new Array(bins).fill(0);
+  const totalMs = new Array(bins).fill(0);
+  for (const { bytes, rttMs } of samples) {
+    const bin = rttSizeBin(bytes);
+    counts[bin]++;
+    totalMs[bin] += rttMs;
+  }
+  return { counts, totalMs };
 }
 
 // Same percentile convention as the benchmark runner's computeStats

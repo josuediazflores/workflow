@@ -71,11 +71,12 @@
  *          payload-embedded-timestamp trick applied to every chunk) and the
  *          reader stamps each chunk's arrival. Samples are aggregated INSIDE
  *          the reader step into chunk-index buckets (seq 0 = stream-open
- *          write / seq 1-20 = warmup / seq 21+ = steady state), chunk-size
- *          buckets (<=256B / 256B-4KB / >4KB, fed by a size-sweep variant
- *          whose deltas are padded in rotation to ~100B/1KB/10KB), a fixed
- *          log-bin histogram per bucket, and a per-tenth-of-stream progress
- *          profile (the drift readout — trends don't bucket well). The
+ *          write / seq 1-20 = warmup / seq 21+ = steady state), a fixed
+ *          log-bin histogram per bucket, and two mean-RTT profiles: per tenth
+ *          of the stream (the drift readout — trends don't bucket well) and
+ *          per log size bin (the size→latency curve, fed by a size-sweep
+ *          variant whose deltas are padded in rotation across log-spaced
+ *          sizes, ~160B to ~12KB serialized). The
  *          runner merges the per-iteration summaries (exact best/avg/count and
  *          histograms; percentile-of-percentiles for p50-p99 — see
  *          mergeRttSummaries). Only the two per-variant pooled rows land in
@@ -117,13 +118,12 @@ import path from 'node:path';
 import { afterAll, beforeAll, describe, test } from 'vitest';
 import { getTrustedSourcesHeaders } from '../../../scripts/trusted-sources-headers.mjs';
 import {
-  type BenchRttProgressProfile,
+  type BenchRttMeanProfile,
   type BenchRttSummary,
-  mergeProgressProfiles,
+  mergeMeanProfiles,
   mergeRttSummaries,
   RTT_HIST_EDGES_MS,
   RTT_INDEX_BUCKETS,
-  RTT_SIZE_BUCKETS,
 } from '../../../workbench/example/workflows/97_bench_rtt';
 import { getRun } from '../src/runtime';
 import { setupWorld } from './utils';
@@ -262,8 +262,8 @@ interface BenchChunkRttResult {
   received: number;
   all?: BenchRttSummary;
   byIndex: Partial<Record<string, BenchRttSummary>>;
-  bySize: Partial<Record<string, BenchRttSummary>>;
-  progress?: BenchRttProgressProfile;
+  progress?: BenchRttMeanProfile;
+  size?: BenchRttMeanProfile;
 }
 
 interface CrttIterationResult {
@@ -635,6 +635,10 @@ interface MetricStats {
   /** Mean RTT per tenth of the stream (CRTT headline rows): the drift/trend
    * readout, rendered as a progress sparkline in the drill-down. */
   progressAvgMs?: number[];
+  /** Mean RTT per log size bin (CRTT sweep headline row): the size→latency
+   * curve, rendered as a size sparkline in the drill-down. Null entries are
+   * bins the sweep left empty. */
+  sizeAvgMs?: (number | null)[];
   /** Short group/bucket labels for drill-down rendering (CRTT: variant and
    * index/size bucket). */
   group?: string;
@@ -716,22 +720,28 @@ function recordCrttMetric(
     bucket,
     detail = false,
     progress,
+    size,
   }: {
     group: string;
     bucket: string;
     detail?: boolean;
-    progress?: BenchRttProgressProfile;
+    progress?: BenchRttMeanProfile;
+    size?: BenchRttMeanProfile;
   }
 ) {
   const merged = mergeRttSummaries(summaries);
   if (!merged) return;
-  // Mean RTT per tenth of the stream; sums/counts merge exactly across
-  // iterations, so these avgs are exact like the histogram.
-  const progressAvgMs = progress?.totalMs.map((total, i) =>
-    progress.counts[i] > 0
-      ? Math.round((total / progress.counts[i]) * 10) / 10
-      : 0
-  );
+  // Mean RTT per profile bin; sums/counts merge exactly across iterations,
+  // so these avgs are exact like the histogram. Empty bins become null so
+  // the renderer can show them as gaps rather than zeros.
+  const profileAvgs = (profile?: BenchRttMeanProfile) =>
+    profile?.totalMs.map((total, i) =>
+      profile.counts[i] > 0
+        ? Math.round((total / profile.counts[i]) * 10) / 10
+        : null
+    );
+  const progressAvgMs = profileAvgs(progress)?.map((v) => v ?? 0);
+  const sizeAvgMs = profileAvgs(size);
   metricRows.push({
     metric: 'crtt',
     scenario,
@@ -749,6 +759,7 @@ function recordCrttMetric(
     group,
     bucket,
     progressAvgMs,
+    sizeAvgMs,
   });
 }
 
@@ -822,7 +833,7 @@ const SCENARIO_DESCRIPTIONS = [
   },
   {
     name: SCENARIO_CHUNK_RTT_SWEEP,
-    description: `same pacing as ${SCENARIO_CHUNK_RTT_LLM}, but deltas are padded in rotation to ~100B/1KB/10KB serialized so per-chunk RTT is bucketed by chunk size instead (the llm-shaped numbers stay pure of padding)`,
+    description: `same pacing as ${SCENARIO_CHUNK_RTT_LLM}, but deltas are padded in rotation across seven log-spaced sizes (~160B to ~12KB serialized) so mean per-chunk RTT is profiled as a function of chunk size (the llm-shaped numbers stay pure of padding)`,
   },
 ];
 
@@ -990,7 +1001,7 @@ describe('workflow benchmarks', () => {
       {
         group: 'llm',
         bucket: 'all',
-        progress: mergeProgressProfiles(results.map((r) => r.crtt.progress)),
+        progress: mergeMeanProfiles(results.map((r) => r.crtt.progress)),
       }
     );
     for (const bucket of RTT_INDEX_BUCKETS) {
@@ -1017,18 +1028,13 @@ describe('workflow benchmarks', () => {
         {
           group: 'sweep',
           bucket: 'all',
-          progress: mergeProgressProfiles(results.map((r) => r.crtt.progress)),
+          progress: mergeMeanProfiles(results.map((r) => r.crtt.progress)),
+          // The size→latency curve, only from the sweep variant: the
+          // llm-shaped deltas all land in the smallest size bin, so a size
+          // profile of them says nothing.
+          size: mergeMeanProfiles(results.map((r) => r.crtt.size)),
         }
       );
-      // Size buckets only from the sweep variant: the llm-shaped deltas all
-      // land in the smallest bucket, so bucketing them by size says nothing.
-      for (const bucket of RTT_SIZE_BUCKETS) {
-        recordCrttMetric(
-          `chunk RTT sweep (${bucket})`,
-          results.map((r) => r.crtt.bySize[bucket]),
-          { group: 'sweep', bucket, detail: true }
-        );
-      }
     }
   );
 

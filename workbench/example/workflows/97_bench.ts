@@ -33,20 +33,19 @@
 //   reader on the same deployment (one clock domain), not an echo back to the
 //   writer. The reader stamps each chunk's arrival, computes
 //   `rtt = Date.now() - chunk.writtenAt`, and aggregates on the deployment
-//   into chunk-index and chunk-size buckets (see 97_bench_rtt.ts), returning
-//   compact per-bucket summaries — percentiles plus fixed log-bin histograms
-//   — instead of hundreds of raw samples.
+//   (see 97_bench_rtt.ts): chunk-index buckets, mean-RTT profiles over stream
+//   progress and over serialized chunk size, and fixed log-bin histograms —
+//   compact aggregates instead of hundreds of raw samples.
 
 import { createHook, getWorkflowMetadata, getWritable } from 'workflow';
 import { getRun } from 'workflow/api';
 import {
-  type BenchRttProgressProfile,
+  type BenchRttMeanProfile,
   type BenchRttSummary,
   progressProfile,
   type RttIndexBucket,
-  type RttSizeBucket,
   rttIndexBucket,
-  rttSizeBucket,
+  sizeProfile,
   summarizeRttSamples,
 } from './97_bench_rtt';
 
@@ -174,10 +173,10 @@ export interface BenchChunkRttDelta {
   pad?: string;
 }
 
-/** CRTT payload variant. `'llm'` streams LLM-shaped deltas (all landing in
- * the smallest size bucket, so the index-bucket numbers stay pure);
- * `'sweep'` pads deltas in rotation so per-chunk RTT can be bucketed by
- * serialized chunk size. */
+/** CRTT payload variant. `'llm'` streams LLM-shaped deltas (a few tens of
+ * bytes each, so the index numbers stay pure of padding); `'sweep'` pads
+ * deltas in rotation across log-spaced sizes so mean RTT can be profiled as
+ * a function of serialized chunk size. */
 export type BenchChunkRttVariant = 'llm' | 'sweep';
 
 /** Reader-side aggregation of one CRTT run: per-bucket summaries computed on
@@ -189,16 +188,21 @@ export interface BenchChunkRttResult {
   /** All chunks pooled — the headline "average per-chunk RTT" summary. */
   all?: BenchRttSummary;
   byIndex: Partial<Record<RttIndexBucket, BenchRttSummary>>;
-  bySize: Partial<Record<RttSizeBucket, BenchRttSummary>>;
   /** Mean RTT per tenth of the stream — the drift/trend readout that fixed
    * index buckets cannot provide (see progressProfile in 97_bench_rtt.ts). */
-  progress: BenchRttProgressProfile;
+  progress: BenchRttMeanProfile;
+  /** Mean RTT per log size bin — the size→latency curve (only informative
+   * for the `'sweep'` variant, whose pad rotation occupies every bin). */
+  size: BenchRttMeanProfile;
 }
 
-// Pad lengths cycled by the CRTT `'sweep'` variant. With the ~50B base chunk
-// these serialize to roughly 120B / 1.1KB / 10.3KB — one representative per
-// size bucket (<=256B / 256B-4KB / >4KB).
-const CRTT_SWEEP_PAD_LENGTHS = [64, 1024, 10240];
+// Pad lengths cycled by the CRTT `'sweep'` variant: a log ladder chosen so
+// the ~60B base chunk serializes to one representative size per size-profile
+// bin (~160B, ~400B, ~760B, ~1.5KB, ~3KB, ~6KB, ~12KB — see
+// RTT_SIZE_BIN_EDGES_BYTES in 97_bench_rtt.ts). Rotation decouples size from
+// seq: every size appears throughout the stream, so the size profile is not
+// confounded with warmup or drift.
+const CRTT_SWEEP_PAD_LENGTHS = [100, 340, 700, 1400, 3000, 6000, 12000];
 
 async function timedNoopStep(index: number): Promise<BenchStepTiming> {
   'use step';
@@ -508,8 +512,8 @@ async function crttReaderStep(): Promise<BenchChunkRttResult> {
     // progress profile bins by position in the stream even if delivery ever
     // reorders.
     const rttBySeq: (number | undefined)[] = [];
+    const sizeSamples: { bytes: number; rttMs: number }[] = [];
     const byIndex = new Map<RttIndexBucket, number[]>();
-    const bySize = new Map<RttSizeBucket, number[]>();
     let received = 0;
     let result = await firstRead;
     while (!result.done) {
@@ -525,16 +529,14 @@ async function crttReaderStep(): Promise<BenchChunkRttResult> {
         );
       }
       const rtt = Math.max(0, receivedAt - chunk.writtenAt);
-      const size = JSON.stringify(chunk).length;
       all.push(rtt);
       rttBySeq[chunk.seq] = rtt;
-      const push = <K>(map: Map<K, number[]>, key: K) => {
-        const samples = map.get(key);
-        if (samples) samples.push(rtt);
-        else map.set(key, [rtt]);
-      };
-      push(byIndex, rttIndexBucket(chunk.seq));
-      push(bySize, rttSizeBucket(size));
+      // Approximate serialized bytes (ASCII payloads, so chars ≈ bytes).
+      sizeSamples.push({ bytes: JSON.stringify(chunk).length, rttMs: rtt });
+      const bucket = rttIndexBucket(chunk.seq);
+      const samples = byIndex.get(bucket);
+      if (samples) samples.push(rtt);
+      else byIndex.set(bucket, [rtt]);
       received++;
       result = await reader.read();
     }
@@ -550,8 +552,8 @@ async function crttReaderStep(): Promise<BenchChunkRttResult> {
       received,
       all: summarizeRttSamples(all),
       byIndex: summarize(byIndex),
-      bySize: summarize(bySize),
       progress: progressProfile(rttBySeq),
+      size: sizeProfile(sizeSamples),
     };
   } finally {
     reader.cancel().catch(() => {});
@@ -616,12 +618,13 @@ async function crttWriterStep(
  * and the reader computes each chunk's write->read RTT on arrival (the "round
  * trip" being deployment -> stream backend -> co-located reader, not an echo
  * back to the writer). The reader aggregates the samples on the deployment
- * into chunk-index buckets and chunk-size buckets (see 97_bench_rtt.ts) and
- * the workflow returns those compact summaries, each carrying a fixed
- * log-bin histogram so distributions merge and diff exactly across runs. The `'llm'` variant streams the same LLM-shaped deltas as
- * SO (index bucketing on pure token-shaped traffic); the `'sweep'` variant
- * pads deltas in rotation to ~100B/1KB/10KB so RTT can be compared across
- * chunk sizes.
+ * (see 97_bench_rtt.ts): chunk-index buckets, a per-tenth-of-stream progress
+ * profile, a per-log-size-bin size profile, and fixed log-bin histograms so
+ * distributions merge and diff exactly across runs. The `'llm'` variant
+ * streams the same LLM-shaped deltas as SO (index/progress numbers pure of
+ * padding); the `'sweep'` variant pads deltas in rotation across log-spaced
+ * sizes (~160B to ~12KB serialized) so the size profile becomes a
+ * size->latency curve.
  */
 export async function benchCrttWorkflow(
   chunkCount: number,
