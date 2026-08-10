@@ -153,6 +153,7 @@ export async function getNextBuilderEager(
             : resolve(this.config.workingDir, pathname)
           ).replace(/\\/g, '/');
         let sourceSnapshots = new Map<string, SourceSnapshot>();
+        let buildInProgress = false;
 
         const watchableExtensions = new Set([
           '.js',
@@ -218,6 +219,15 @@ export async function getNextBuilderEager(
             ...workflowsManifest.classes,
           },
         });
+
+        const runBuild = async (build: () => Promise<void>) => {
+          buildInProgress = true;
+          try {
+            await build();
+          } finally {
+            buildInProgress = false;
+          }
+        };
 
         const hotRebuild = async (refreshStepRegistrations: boolean) => {
           if (refreshStepRegistrations) {
@@ -438,7 +448,7 @@ export async function getNextBuilderEager(
           }
           if (decision.kind === 'full') {
             logDevHmr('workflow dev hmr: full rediscovery');
-            await fullRebuild();
+            await runBuild(fullRebuild);
             await refreshKnownFiles();
             return;
           }
@@ -446,33 +456,39 @@ export async function getNextBuilderEager(
           logDevHmr(
             `workflow dev hmr: hot rebuild${decision.refreshStepRegistrations ? ' with step registration refresh' : ''}`
           );
-          await hotRebuild(decision.refreshStepRegistrations);
+          await runBuild(() => hotRebuild(decision.refreshStepRegistrations));
           for (const [file, snapshot] of decision.snapshots) {
             sourceSnapshots.set(file, snapshot);
           }
         };
 
-        const scheduleFileChanges = createFileChangeScheduler(
-          async (request) => {
-            try {
-              switch (request.kind) {
-                case 'changes':
-                  await processFileChanges(request.fileChanges);
-                  return;
-                case 'full':
-                  logDevHmr('workflow dev hmr: full rediscovery');
-                  await fullRebuild();
-                  await refreshKnownFiles();
-                  return;
-                default:
-                  request satisfies never;
-                  throw new Error('Unknown scheduled rebuild');
-              }
-            } catch (error) {
-              console.error('Failed to process file change', error);
+        const scheduleRebuild = createFileChangeScheduler(async (request) => {
+          try {
+            switch (request.kind) {
+              case 'changes':
+                await processFileChanges(request.fileChanges);
+                return;
+              case 'full':
+                logDevHmr('workflow dev hmr: full rediscovery');
+                await runBuild(fullRebuild);
+                await refreshKnownFiles();
+                return;
+              default:
+                request satisfies never;
+                throw new Error('Unknown scheduled rebuild');
             }
+          } catch (error) {
+            console.error('Failed to process file change', error);
           }
-        );
+        });
+        const scheduleFileChanges = (fileChanges: FileChanges) => {
+          scheduleRebuild({ kind: 'changes', fileChanges });
+        };
+        const scheduleBuildOverlap = () => {
+          if (buildInProgress) {
+            scheduleRebuild({ kind: 'full' });
+          }
+        };
 
         const resolveExistingEventPath = async (pathname: string) => {
           const normalizedPath = normalizePath(pathname);
@@ -558,12 +574,15 @@ export async function getNextBuilderEager(
         });
 
         watcher.on('add', (pathname) => {
+          scheduleBuildOverlap();
           void handleFileAdded(pathname);
         });
         watcher.on('change', (pathname) => {
+          scheduleBuildOverlap();
           void handleFileChanged(pathname);
         });
         watcher.on('unlink', (pathname) => {
+          scheduleBuildOverlap();
           handleFileRemoved(pathname);
         });
         watcher.on('error', (error) => {

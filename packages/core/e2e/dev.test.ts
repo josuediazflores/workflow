@@ -228,6 +228,7 @@ export function createDevTests(config?: DevTestConfig) {
         skip: ExpectedHmrLogCount;
         hot: ExpectedHmrLogCount;
         full: ExpectedHmrLogCount;
+        total?: ExpectedHmrLogCount;
       }
     ) => {
       if (cursor === undefined) {
@@ -257,6 +258,15 @@ export function createDevTests(config?: DevTestConfig) {
             countLogMessage(log, hmrLogMessages.full),
             expected.full
           );
+          if (expected.total !== undefined) {
+            expectLogCount(
+              countLogMessage(log, hmrLogMessages.ignored) +
+                countLogMessage(log, hmrLogMessages.skip) +
+                countLogMessage(log, hmrLogMessages.hot) +
+                countLogMessage(log, hmrLogMessages.full),
+              expected.total
+            );
+          }
         },
       });
     };
@@ -1075,7 +1085,13 @@ ${apiFileContent}`
           {
             file: files.step,
             kind: 'none',
-            expectedLogCounts: { skip: 1, hot: 0, full: 0 },
+            // A queued setup rebuild may already have snapshotted this file.
+            expectedLogCounts: {
+              skip: { min: 0, max: 1 },
+              hot: 0,
+              full: { min: 0, max: 1 },
+              total: 1,
+            },
             expectedStepValue: (iteration: number) => `step-only-${iteration}`,
             source: (
               iteration: number
@@ -1353,6 +1369,11 @@ export async function hmrFuzzAddedWorkflow() {
           },
           {
             description: 'workflow file added through API import',
+            expectedLogCounts: {
+              skip: 0,
+              hot: 0,
+              full: { min: 1, max: 2 },
+            },
             write: async (iteration: number) => {
               await fs.writeFile(
                 files.addedWorkflow,
@@ -1386,7 +1407,11 @@ ${apiFileContent}`
           },
           {
             description: 'workflow file removed from API import',
-            expectedLogCounts: { skip: 0, hot: 0, full: 1 },
+            expectedLogCounts: {
+              skip: 0,
+              hot: 0,
+              full: { min: 1, max: 2 },
+            },
             write: async () => {
               await fs.rm(files.addedWorkflow, { force: true });
               await fs.writeFile(

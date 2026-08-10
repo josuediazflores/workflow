@@ -19,15 +19,21 @@ describe('watch-rebuild scheduling', () => {
     const schedule = createFileChangeScheduler(rebuild);
 
     schedule({
-      addedFiles: [],
-      modifiedFiles: ['/app/workflow.ts'],
-      removedFiles: [],
+      kind: 'changes',
+      fileChanges: {
+        addedFiles: [],
+        modifiedFiles: ['/app/workflow.ts'],
+        removedFiles: [],
+      },
     });
     await vi.advanceTimersByTimeAsync(99);
     schedule({
-      addedFiles: ['/app/helper.ts'],
-      modifiedFiles: [],
-      removedFiles: [],
+      kind: 'changes',
+      fileChanges: {
+        addedFiles: ['/app/helper.ts'],
+        modifiedFiles: [],
+        removedFiles: [],
+      },
     });
     await vi.advanceTimersByTimeAsync(99);
 
@@ -43,7 +49,7 @@ describe('watch-rebuild scheduling', () => {
     });
   });
 
-  test('does one full rebuild after changes overlap a build', async () => {
+  test('collapses full rebuild requests while a rebuild runs', async () => {
     vi.useFakeTimers();
     let finishFirstBuild!: () => void;
     const firstBuild = new Promise<void>((resolve) => {
@@ -64,22 +70,17 @@ describe('watch-rebuild scheduling', () => {
     });
 
     schedule({
-      addedFiles: [],
-      modifiedFiles: ['/app/workflow.ts'],
-      removedFiles: [],
+      kind: 'changes',
+      fileChanges: {
+        addedFiles: [],
+        modifiedFiles: ['/app/workflow.ts'],
+        removedFiles: [],
+      },
     });
     await vi.advanceTimersByTimeAsync(100);
 
-    schedule({
-      addedFiles: [],
-      modifiedFiles: ['/app/workflow.ts'],
-      removedFiles: [],
-    });
-    schedule({
-      addedFiles: [],
-      modifiedFiles: ['/app/helper.ts'],
-      removedFiles: [],
-    });
+    schedule({ kind: 'full' });
+    schedule({ kind: 'full' });
     await vi.advanceTimersByTimeAsync(100);
     finishFirstBuild();
     await fullBuild;

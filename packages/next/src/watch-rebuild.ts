@@ -338,11 +338,11 @@ export const createFileChangeScheduler = (
     }
   };
 
-  return (fileChanges: FileChanges) => {
-    pending =
-      rebuilding || pending?.kind === 'full'
-        ? { kind: 'full' }
-        : {
+  return (request: ScheduledRebuild) => {
+    switch (request.kind) {
+      case 'changes':
+        if (pending?.kind !== 'full') {
+          pending = {
             kind: 'changes',
             fileChanges: mergeFileChanges(
               pending?.fileChanges ?? {
@@ -350,9 +350,18 @@ export const createFileChangeScheduler = (
                 modifiedFiles: [],
                 removedFiles: [],
               },
-              fileChanges
+              request.fileChanges
             ),
           };
+        }
+        break;
+      case 'full':
+        pending = request;
+        break;
+      default:
+        request satisfies never;
+        throw new Error('Unknown scheduled rebuild');
+    }
 
     clearTimeout(timer);
     timer = setTimeout(() => {
