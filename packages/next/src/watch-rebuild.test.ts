@@ -1,11 +1,92 @@
-import { describe, expect, test } from 'vitest';
+import { afterEach, describe, expect, test, vi } from 'vitest';
 import {
   classifyRebuild,
+  createFileChangeScheduler,
   createSourceSnapshotFromSource,
   extractImportSignature,
   type SourceSnapshot,
   stripCommentsFromSource,
 } from './watch-rebuild.js';
+
+afterEach(() => {
+  vi.useRealTimers();
+});
+
+describe('watch-rebuild scheduling', () => {
+  test('merges changes until filesystem writes become quiet', async () => {
+    vi.useFakeTimers();
+    const rebuild = vi.fn(async () => {});
+    const schedule = createFileChangeScheduler(rebuild);
+
+    schedule({
+      addedFiles: [],
+      modifiedFiles: ['/app/workflow.ts'],
+      removedFiles: [],
+    });
+    await vi.advanceTimersByTimeAsync(99);
+    schedule({
+      addedFiles: ['/app/helper.ts'],
+      modifiedFiles: [],
+      removedFiles: [],
+    });
+    await vi.advanceTimersByTimeAsync(99);
+
+    expect(rebuild).not.toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(1);
+    expect(rebuild).toHaveBeenCalledWith({
+      kind: 'changes',
+      fileChanges: {
+        addedFiles: ['/app/helper.ts'],
+        modifiedFiles: ['/app/workflow.ts'],
+        removedFiles: [],
+      },
+    });
+  });
+
+  test('does one full rebuild after changes overlap a build', async () => {
+    vi.useFakeTimers();
+    let finishFirstBuild!: () => void;
+    const firstBuild = new Promise<void>((resolve) => {
+      finishFirstBuild = resolve;
+    });
+    let reportFullBuild!: () => void;
+    const fullBuild = new Promise<void>((resolve) => {
+      reportFullBuild = resolve;
+    });
+    const requests: string[] = [];
+    const schedule = createFileChangeScheduler(async (request) => {
+      requests.push(request.kind);
+      if (requests.length === 1) {
+        await firstBuild;
+      } else {
+        reportFullBuild();
+      }
+    });
+
+    schedule({
+      addedFiles: [],
+      modifiedFiles: ['/app/workflow.ts'],
+      removedFiles: [],
+    });
+    await vi.advanceTimersByTimeAsync(100);
+
+    schedule({
+      addedFiles: [],
+      modifiedFiles: ['/app/workflow.ts'],
+      removedFiles: [],
+    });
+    schedule({
+      addedFiles: [],
+      modifiedFiles: ['/app/helper.ts'],
+      removedFiles: [],
+    });
+    await vi.advanceTimersByTimeAsync(100);
+    finishFirstBuild();
+    await fullBuild;
+
+    expect(requests).toEqual(['changes', 'full']);
+  });
+});
 
 const detectWorkflowPatterns = (source: string) => ({
   hasDirective:

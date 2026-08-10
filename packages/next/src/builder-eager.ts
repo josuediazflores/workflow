@@ -19,6 +19,7 @@ import type { NextConfig as ProjectNextConfig } from 'next';
 import { createWatchIgnorePredicate } from './watch-ignore.js';
 import {
   classifyRebuild,
+  createFileChangeScheduler,
   createSourceSnapshot,
   type FileChanges,
   getRelevantFiles,
@@ -189,15 +190,6 @@ export async function getNextBuilderEager(
           return isIgnoredWatchPath(normalizedPath);
         };
 
-        let rebuildQueue = Promise.resolve();
-
-        const enqueue = (task: () => Promise<void>) => {
-          rebuildQueue = rebuildQueue.then(task).catch((error) => {
-            console.error('Failed to process file change', error);
-          });
-          return rebuildQueue;
-        };
-
         const readSourceSnapshot = (file: string) =>
           createSourceSnapshot({ file, detectWorkflowPatterns });
 
@@ -357,18 +349,6 @@ export async function getNextBuilderEager(
           return { files, aliases, addKnownFile };
         };
 
-        const mergeFileChanges = (
-          left: FileChanges,
-          right: FileChanges
-        ): FileChanges => ({
-          addedFiles: unique([...left.addedFiles, ...right.addedFiles]),
-          modifiedFiles: unique([
-            ...left.modifiedFiles,
-            ...right.modifiedFiles,
-          ]),
-          removedFiles: unique([...left.removedFiles, ...right.removedFiles]),
-        });
-
         const unique = (paths: string[]) => [...new Set(paths)];
 
         const classifyFileChanges = ({
@@ -472,32 +452,27 @@ export async function getNextBuilderEager(
           }
         };
 
-        let pendingFileChanges: FileChanges = {
-          addedFiles: [],
-          modifiedFiles: [],
-          removedFiles: [],
-        };
-        let flushTimer: ReturnType<typeof setTimeout> | undefined;
-
-        const scheduleFileChanges = (fileChanges: FileChanges) => {
-          pendingFileChanges = mergeFileChanges(
-            pendingFileChanges,
-            fileChanges
-          );
-          if (flushTimer) {
-            return;
+        const scheduleFileChanges = createFileChangeScheduler(
+          async (request) => {
+            try {
+              switch (request.kind) {
+                case 'changes':
+                  await processFileChanges(request.fileChanges);
+                  return;
+                case 'full':
+                  logDevHmr('workflow dev hmr: full rediscovery');
+                  await fullRebuild();
+                  await refreshKnownFiles();
+                  return;
+                default:
+                  request satisfies never;
+                  throw new Error('Unknown scheduled rebuild');
+              }
+            } catch (error) {
+              console.error('Failed to process file change', error);
+            }
           }
-          flushTimer = setTimeout(() => {
-            const fileChanges = pendingFileChanges;
-            pendingFileChanges = {
-              addedFiles: [],
-              modifiedFiles: [],
-              removedFiles: [],
-            };
-            flushTimer = undefined;
-            enqueue(() => processFileChanges(fileChanges));
-          }, 10);
-        };
+        );
 
         const resolveExistingEventPath = async (pathname: string) => {
           const normalizedPath = normalizePath(pathname);

@@ -14,6 +14,10 @@ export interface FileChanges {
   removedFiles: string[];
 }
 
+export type ScheduledRebuild =
+  | { kind: 'changes'; fileChanges: FileChanges }
+  | { kind: 'full' };
+
 export interface SourceSnapshot {
   contentHash: string;
   importSignature: string;
@@ -299,6 +303,64 @@ const didSourceSnapshotChange = (
   previousSnapshot.hasSerde !== nextSnapshot.hasSerde;
 
 const unique = (paths: string[]) => [...new Set(paths)];
+
+const mergeFileChanges = (
+  left: FileChanges,
+  right: FileChanges
+): FileChanges => ({
+  addedFiles: unique([...left.addedFiles, ...right.addedFiles]),
+  modifiedFiles: unique([...left.modifiedFiles, ...right.modifiedFiles]),
+  removedFiles: unique([...left.removedFiles, ...right.removedFiles]),
+});
+
+export const createFileChangeScheduler = (
+  rebuild: (request: ScheduledRebuild) => Promise<void>
+) => {
+  let pending: ScheduledRebuild | undefined;
+  let rebuilding = false;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+
+  const flush = async () => {
+    if (rebuilding || timer || !pending) {
+      return;
+    }
+
+    const request = pending;
+    pending = undefined;
+    rebuilding = true;
+    try {
+      await rebuild(request);
+    } finally {
+      rebuilding = false;
+      if (pending && !timer) {
+        void flush();
+      }
+    }
+  };
+
+  return (fileChanges: FileChanges) => {
+    pending =
+      rebuilding || pending?.kind === 'full'
+        ? { kind: 'full' }
+        : {
+            kind: 'changes',
+            fileChanges: mergeFileChanges(
+              pending?.fileChanges ?? {
+                addedFiles: [],
+                modifiedFiles: [],
+                removedFiles: [],
+              },
+              fileChanges
+            ),
+          };
+
+    clearTimeout(timer);
+    timer = setTimeout(() => {
+      timer = undefined;
+      void flush();
+    }, 100);
+  };
+};
 
 const snapshotChangedFile = async ({
   file,
