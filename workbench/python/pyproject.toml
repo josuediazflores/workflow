@@ -5,6 +5,10 @@ description = "Python conformance target for the @workflow/core e2e suite"
 requires-python = ">=3.10"
 dependencies = [
   "vercel",
+  # A transitive dependency of `vercel`, declared here only so the git pin in
+  # `[tool.uv.sources]` below applies to it — a source is ignored for anything
+  # this project does not require directly. See the note there.
+  "vercel-queue",
   # vercel-py carries uvicorn as a dev-only dependency, so declare it here.
   "uvicorn>=0.30",
 ]
@@ -14,19 +18,28 @@ dependencies = [
 # being built. Bump `rev` deliberately, and re-run the suite when you do.
 #
 # `subdirectory` is required — the vercel-py repo root is a uv workspace whose
-# build backend raises, so only `src/vercel` is installable on its own. Whether
-# its siblings (vercel-queue, vercel-internal-core, ...) then come from PyPI or
-# from the same git rev is upstream's call, not ours: uv follows workspace
-# sources through a git dependency, so a rev that declares them pulls nine more
-# packages out of the checkout. Read `uv.lock` after a bump — if a fix you are
-# chasing lives in a sibling that resolves from PyPI, the rev did not deliver it.
+# build backend raises, so only the leaf packages are installable on their own.
+#
+# Two entries, not one, and the second is what makes the first mean anything. A
+# `[tool.uv.sources]` entry applies only to a package this project requires
+# *directly*, so pinning `vercel` alone left every sibling — `vercel-queue`
+# included — resolving from PyPI. Naming `vercel-queue` here (and in
+# `dependencies` above) makes uv resolve the whole vercel-py workspace out of
+# the checkout instead, so all nine packages come from this one rev. Read
+# `uv.lock` after a bump and check the `source` lines are `git`.
+#
+# It matters because the Vercel world's CBOR queue transport spans two packages:
+# `vercel` attaches the codec to a `Topic` / `TopicPattern` (vercel-py#265), and
+# those types only learned to carry one in `vercel-queue` (vercel-py#266). The
+# released vercel-queue predates #266, so a `vercel`-only bump raises at import.
 #
 # Regenerate the lock with `uv lock --no-config`. A global `exclude-newer` in
 # `~/.config/uv/uv.toml` is otherwise recorded in `uv.lock`, and CI and the
 # Vercel builder — which have no such config — then reject the lock under
 # `--locked`.
 [tool.uv.sources]
-vercel = { git = "https://github.com/vercel/vercel-py", rev = "a36e0f55b2bc0d762225acd7e60abe32f5b3445a", subdirectory = "src/vercel" }
+vercel = { git = "https://github.com/vercel/vercel-py", rev = "36d5763a62cf81f23425187f06c4001d048d4f53", subdirectory = "src/vercel" }
+vercel-queue = { git = "https://github.com/vercel/vercel-py", rev = "36d5763a62cf81f23425187f06c4001d048d4f53", subdirectory = "src/vercel-queue" }
 
 # How `@vercel/python` builds this app. Reached only because `vercel.json`
 # declares `pyproject.toml` as the build src, which puts the builder in

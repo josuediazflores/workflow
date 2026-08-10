@@ -6,7 +6,9 @@ TypeScript — one source of truth for what the protocol is — and this app is 
 second implementation it drives.
 
 Built on [vercel-py](https://github.com/vercel/vercel-py), pinned by commit in
-`pyproject.toml`. Bump that `rev` deliberately and re-run the suite when you do.
+`pyproject.toml` — two entries at the same `rev`, `vercel` and `vercel-queue`,
+which is what drags the whole vercel-py workspace out of the checkout instead of
+PyPI. Bump both together, deliberately, and re-run the suite when you do.
 
 ## Running it
 
@@ -116,29 +118,31 @@ A `trustedSources.projects` entry would additionally let a locally pulled
 not need it for CI.
 
 The divergences that bite are catalogued in vercel-py's queue notes — region
-routing, JSON-only queue transport, no delivery cap, and a one-second floor on
-immediate re-enqueues.
+routing, no delivery cap, and a one-second floor on immediate re-enqueues.
 
-**One of them currently blocks this lane outright.** With the builder pinned and
-queue mode reached, every delivery still 500s:
+The one that used to block this lane outright was the queue transport. Once
+queue mode was reached, every delivery 500'd on `UnicodeDecodeError: 'utf-8'
+codec can't decode byte 0xb9` → `MessageCorruptedError`. `0xb9` is CBOR:
+`@workflow/world-vercel` publishes the invoke payload with `CborTransport`
+(`packages/world-vercel/src/queue.ts:34`) whenever the run's `specVersion >= 3`,
+and the run's spec version comes from whoever *created* it. Here that is the
+TypeScript driver, stamping 5 from `world-vercel`'s own `specVersion`, so
+Python's declared 2 never enters the decision. vercel-py had only a JSON
+consumer path. Nothing in this repo could override either side without pinning
+the lane to a legacy spec version, which would have made the one lane testing
+the current protocol the one lane not testing it.
 
-```
-transports.py:136  text = (await _collect_bytes_async(payload)).decode("utf-8")
-UnicodeDecodeError: 'utf-8' codec can't decode byte 0xb9 in position 0
-→ MessageCorruptedError: Message … is corrupted: Failed to parse payload
-```
+vercel-py fixed it in two parts, which is why the pin below reaches for two
+packages: `vercel-py#265` attaches a CBOR-with-JSON-fallback transport to the
+workflow topic, and `vercel-py#266` taught `Topic` / `TopicPattern` to carry a
+codec in the first place. Attaching it to the *subscription* rather than to a
+client is what makes it work when deployed — the function that receives a push
+delivery is the builder-generated `_vc_queue_handlers/<name>.py`, whose
+`vercel.queue.asgi_app()` constructs its own `QueueClient` with no arguments, so
+a transport set on the world's client would never have been consulted.
 
-`0xb9` is CBOR. `@workflow/world-vercel` publishes the invoke payload with
-`CborTransport` (`packages/world-vercel/src/queue.ts:34`) for `specVersion >= 3`,
-and vercel-py's queue consumer has only a JSON path — `subscribe()` takes no
-`transport`, and the default `RawJsonTransport` ignores `content_type` and
-always decodes UTF-8. Nothing in this repo can override either side without
-pinning the lane to a legacy spec version, which would defeat the point of
-having it. It needs a CBOR transport in vercel-py; tracked as §6 of that repo's
-`python-ts-queue-divergences.md`.
-
-`world-local` is unaffected — Python is producer and consumer there, so JSON on
-both ends is self-consistent, and the local conformance lane passes.
+`world-local` was never affected — Python is producer and consumer there, so
+JSON on both ends is self-consistent.
 
 ## Conformance baseline
 
