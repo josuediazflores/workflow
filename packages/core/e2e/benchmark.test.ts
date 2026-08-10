@@ -70,10 +70,12 @@
  *          Every delta embeds `{ seq, writtenAt }` (the SL scenario's
  *          payload-embedded-timestamp trick applied to every chunk) and the
  *          reader stamps each chunk's arrival. Samples are aggregated INSIDE
- *          the reader step into chunk-index buckets (seq 0 / 1-20 / 21-100 /
- *          101+), chunk-size buckets (<=256B / 256B-4KB / >4KB, fed by a
- *          size-sweep variant whose deltas are padded in rotation to
- *          ~100B/1KB/10KB), and a fixed log-bin histogram per bucket. The
+ *          the reader step into chunk-index buckets (seq 0 = stream-open
+ *          write / seq 1-20 = warmup / seq 21+ = steady state), chunk-size
+ *          buckets (<=256B / 256B-4KB / >4KB, fed by a size-sweep variant
+ *          whose deltas are padded in rotation to ~100B/1KB/10KB), a fixed
+ *          log-bin histogram per bucket, and a per-tenth-of-stream progress
+ *          profile (the drift readout — trends don't bucket well). The
  *          runner merges the per-iteration summaries (exact best/avg/count and
  *          histograms; percentile-of-percentiles for p50-p99 — see
  *          mergeRttSummaries). Only the two per-variant pooled rows land in
@@ -115,7 +117,9 @@ import path from 'node:path';
 import { afterAll, beforeAll, describe, test } from 'vitest';
 import { getTrustedSourcesHeaders } from '../../../scripts/trusted-sources-headers.mjs';
 import {
+  type BenchRttProgressProfile,
   type BenchRttSummary,
+  mergeProgressProfiles,
   mergeRttSummaries,
   RTT_HIST_EDGES_MS,
   RTT_INDEX_BUCKETS,
@@ -259,6 +263,7 @@ interface BenchChunkRttResult {
   all?: BenchRttSummary;
   byIndex: Partial<Record<string, BenchRttSummary>>;
   bySize: Partial<Record<string, BenchRttSummary>>;
+  progress?: BenchRttProgressProfile;
 }
 
 interface CrttIterationResult {
@@ -627,6 +632,9 @@ interface MetricStats {
   /** Drill-down rows (e.g. CRTT per-bucket splits): kept out of the PR
    * comment's main results table and rendered in a collapsed section. */
   detail?: boolean;
+  /** Mean RTT per tenth of the stream (CRTT headline rows): the drift/trend
+   * readout, rendered as a progress sparkline in the drill-down. */
+  progressAvgMs?: number[];
   /** Short group/bucket labels for drill-down rendering (CRTT: variant and
    * index/size bucket). */
   group?: string;
@@ -707,10 +715,23 @@ function recordCrttMetric(
     group,
     bucket,
     detail = false,
-  }: { group: string; bucket: string; detail?: boolean }
+    progress,
+  }: {
+    group: string;
+    bucket: string;
+    detail?: boolean;
+    progress?: BenchRttProgressProfile;
+  }
 ) {
   const merged = mergeRttSummaries(summaries);
   if (!merged) return;
+  // Mean RTT per tenth of the stream; sums/counts merge exactly across
+  // iterations, so these avgs are exact like the histogram.
+  const progressAvgMs = progress?.totalMs.map((total, i) =>
+    progress.counts[i] > 0
+      ? Math.round((total / progress.counts[i]) * 10) / 10
+      : 0
+  );
   metricRows.push({
     metric: 'crtt',
     scenario,
@@ -727,6 +748,7 @@ function recordCrttMetric(
     detail: detail || undefined,
     group,
     bucket,
+    progressAvgMs,
   });
 }
 
@@ -796,7 +818,7 @@ const SCENARIO_DESCRIPTIONS = [
   },
   {
     name: SCENARIO_CHUNK_RTT_LLM,
-    description: `writer streams the same paced ${SO_CHUNK_COUNT}-chunk LLM-shaped workload as the SO scenarios, but every delta embeds { seq, writtenAt }; the reader stamps each chunk's arrival and aggregates per-chunk write->read RTT on the deployment, bucketed by chunk index (seq 0 pays the attach/first-delivery cost, then early/mid/steady-state ranges)`,
+    description: `writer streams the same paced ${SO_CHUNK_COUNT}-chunk LLM-shaped workload as the SO scenarios, but every delta embeds { seq, writtenAt }; the reader stamps each chunk's arrival and aggregates per-chunk write->read RTT on the deployment, split by chunk index (seq 0 = stream-open write, seq 1-20 = warmup, seq 21+ = steady state) plus a mean-RTT-per-tenth-of-stream progress profile that surfaces drift`,
   },
   {
     name: SCENARIO_CHUNK_RTT_SWEEP,
@@ -965,7 +987,11 @@ describe('workflow benchmarks', () => {
     recordCrttMetric(
       SCENARIO_CHUNK_RTT_LLM,
       results.map((r) => r.crtt.all),
-      { group: 'llm', bucket: 'all' }
+      {
+        group: 'llm',
+        bucket: 'all',
+        progress: mergeProgressProfiles(results.map((r) => r.crtt.progress)),
+      }
     );
     for (const bucket of RTT_INDEX_BUCKETS) {
       recordCrttMetric(
@@ -988,7 +1014,11 @@ describe('workflow benchmarks', () => {
       recordCrttMetric(
         SCENARIO_CHUNK_RTT_SWEEP,
         results.map((r) => r.crtt.all),
-        { group: 'sweep', bucket: 'all' }
+        {
+          group: 'sweep',
+          bucket: 'all',
+          progress: mergeProgressProfiles(results.map((r) => r.crtt.progress)),
+        }
       );
       // Size buckets only from the sweep variant: the llm-shaped deltas all
       // land in the smallest bucket, so bucketing them by size says nothing.

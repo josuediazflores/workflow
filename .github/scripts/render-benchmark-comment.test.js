@@ -521,7 +521,11 @@ function crttResult({ avg = 120, detailAvg = 130, hist }) {
       { name: 'chunk RTT (llm)', description: 'self-timestamping chunks' },
     ],
     metrics: [
-      row('chunk RTT (llm)', { group: 'llm', bucket: 'all' }),
+      row('chunk RTT (llm)', {
+        group: 'llm',
+        bucket: 'all',
+        progressAvgMs: [110, 112, 115, 113, 118, 120, 119, 125, 130, 135],
+      }),
       row('chunk RTT llm (seq 0)', {
         group: 'llm',
         bucket: 'seq 0',
@@ -572,13 +576,19 @@ test('renders the CRTT drill-down as a sparkline matrix', async () => {
   // No per-bucket bar charts anymore — the matrix is the whole section.
   assert.doesNotMatch(body, /Avg RTT:/);
   assert.doesNotMatch(body, /chunks \d/);
+  // Progress profile: one line per variant that recorded one, min→max
+  // scaled bars with the ms range alongside.
+  assert.match(body, /RTT over stream progress \(avg per tenth of stream/);
+  assert.match(body, /llm {2}▁[▁▂▃▄▅▆▇█]{8}█ {2}110–135ms/);
   // Footer smallprint explains the sparklines.
   assert.match(body, /<sub>The collapsed \*\*CRTT drill-down\*\* shows one/);
-  // Histograms are stripped from the embedded history data block, like raw
-  // samples (the artifacts keep them; only the comment payload slims down).
+  // Histograms and progress profiles are stripped from the embedded history
+  // data block, like raw samples (the artifacts keep them; only the comment
+  // payload slims down).
   const history = extractHistory(body);
   const row = history[0].results[0].metrics[0];
   assert.strictEqual(row.hist, undefined);
+  assert.strictEqual(row.progressAvgMs, undefined);
   assert.strictEqual(row.baselineAvg, 150);
   // Re-rendering from history keeps the table but drops the drill-down.
   const rerendered = renderComment({

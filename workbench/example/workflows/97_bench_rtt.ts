@@ -59,23 +59,82 @@ export function histogramRttSamples(samples: number[]): number[] {
   return counts;
 }
 
-// Chunk-index buckets, aligned in spirit with the STSO progress split: the
-// first chunk pays the stream's attach/first-delivery cost, seq 1-20 covers
-// the early stream (where a UI is painting first tokens), seq 21-100 the
-// mid-stream ramp, and seq 101+ the steady state of a long response.
-export const RTT_INDEX_BUCKETS = [
-  'seq 0',
-  'seq 1-20',
-  'seq 21-100',
-  'seq 101+',
-] as const;
+// Chunk-index buckets. Each boundary is tied to a mechanism, not a progress
+// range:
+// - 'seq 0': the stream-open write (stream creation / cold write path). Also
+//   a cross-check against the SL scenario, which times the same first-chunk
+//   propagation.
+// - 'seq 1-20': warmup — the first ~200ms at the modeled 100 chunks/s, where
+//   connections, buffers, and flush cycles are still settling.
+// - 'seq 21+': steady state, kept as ONE bucket so its large n gives stable
+//   tail percentiles (splitting it further just compares noise floors of
+//   unequal sample sizes — iteration-level stalls land in whichever range
+//   they land in).
+// Latency *drift* across the stream (cumulative log/buffer growth) is a
+// trend, which fixed buckets detect badly; that is the progress profile's
+// job (see {@link progressProfile}).
+export const RTT_INDEX_BUCKETS = ['seq 0', 'seq 1-20', 'seq 21+'] as const;
 export type RttIndexBucket = (typeof RTT_INDEX_BUCKETS)[number];
 
 export function rttIndexBucket(seq: number): RttIndexBucket {
   if (seq <= 0) return 'seq 0';
   if (seq <= 20) return 'seq 1-20';
-  if (seq <= 100) return 'seq 21-100';
-  return 'seq 101+';
+  return 'seq 21+';
+}
+
+// Number of equal fractions of the stream in the progress profile. Ten keeps
+// the profile line compact while still localizing a drift or a slow phase.
+export const RTT_PROGRESS_BINS = 10;
+
+/** Per-fraction-of-stream RTT totals: `totalMs[i]`/`counts[i]` is the mean
+ * RTT of the i-th tenth of the stream. Fraction-based (not absolute seq), so
+ * profiles are comparable across chunk counts; sums and counts merge exactly
+ * across iterations and runs. */
+export interface BenchRttProgressProfile {
+  counts: number[];
+  totalMs: number[];
+}
+
+/** Builds the progress profile from per-seq RTT samples (`rttBySeq[seq]` =
+ * that chunk's RTT; sparse entries are skipped defensively). The trend this
+ * surfaces — does per-chunk RTT rise as the stream grows? — is what fixed
+ * index buckets cannot answer without arbitrary boundaries. */
+export function progressProfile(
+  rttBySeq: readonly (number | undefined)[]
+): BenchRttProgressProfile {
+  const counts = new Array(RTT_PROGRESS_BINS).fill(0);
+  const totalMs = new Array(RTT_PROGRESS_BINS).fill(0);
+  const n = rttBySeq.length;
+  for (let seq = 0; seq < n; seq++) {
+    const rtt = rttBySeq[seq];
+    if (typeof rtt !== 'number') continue;
+    const bin = Math.min(
+      RTT_PROGRESS_BINS - 1,
+      Math.floor((seq * RTT_PROGRESS_BINS) / n)
+    );
+    counts[bin]++;
+    totalMs[bin] += rtt;
+  }
+  return { counts, totalMs };
+}
+
+/** Merges progress profiles by summation — exact, like the histograms. */
+export function mergeProgressProfiles(
+  profiles: readonly (BenchRttProgressProfile | undefined)[]
+): BenchRttProgressProfile | undefined {
+  const present = profiles.filter(
+    (p): p is BenchRttProgressProfile => p != null
+  );
+  if (present.length === 0) return undefined;
+  const counts = new Array(RTT_PROGRESS_BINS).fill(0);
+  const totalMs = new Array(RTT_PROGRESS_BINS).fill(0);
+  for (const p of present) {
+    for (let i = 0; i < RTT_PROGRESS_BINS; i++) {
+      counts[i] += p.counts[i] ?? 0;
+      totalMs[i] += p.totalMs[i] ?? 0;
+    }
+  }
+  return { counts, totalMs };
 }
 
 // Chunk-size buckets (approximate serialized bytes). The boundaries cleanly

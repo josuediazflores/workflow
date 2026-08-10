@@ -145,7 +145,7 @@ function stripRawSamples(entries) {
     results: (entry.results ?? []).map((result) => ({
       ...result,
       metrics: (result.metrics ?? []).map(
-        ({ raw, baselineRaw, hist, ...row }) => row
+        ({ raw, baselineRaw, hist, progressAvgMs, ...row }) => row
       ),
     })),
   }));
@@ -585,6 +585,45 @@ function renderCrttMatrixSection(result) {
   }
   lines.push('```');
 
+  // Progress profiles: mean RTT per tenth of the stream, one line per
+  // variant. This is the drift readout — a rising staircase means chunks get
+  // slower as the stream grows, which fixed index buckets can't localize.
+  // Bars are scaled min→max per line so the *shape* (where in the stream it
+  // changes) stays readable even for small drifts; the ms range alongside is
+  // what says whether the shape matters.
+  const profileRows = rows.filter(
+    (row) => Array.isArray(row.progressAvgMs) && row.progressAvgMs.length > 0
+  );
+  if (profileRows.length > 0) {
+    const labelWidth = Math.max(
+      ...profileRows.map((r) => (r.group ?? '').length)
+    );
+    lines.push(
+      '',
+      'RTT over stream progress (avg per tenth of stream, bars scaled min→max):',
+      '',
+      '```'
+    );
+    for (const row of profileRows) {
+      const avgs = row.progressAvgMs;
+      const min = Math.min(...avgs);
+      const max = Math.max(...avgs);
+      const span = max - min;
+      const bars = avgs
+        .map((v) =>
+          span <= 0
+            ? SPARK_LEVELS[0]
+            : SPARK_LEVELS[
+                Math.round(((v - min) / span) * (SPARK_LEVELS.length - 1))
+              ]
+        )
+        .join('');
+      const range = `${Math.round(min)}–${Math.round(max)}ms`;
+      lines.push(`${(row.group ?? '').padEnd(labelWidth)}  ${bars}  ${range}`);
+    }
+    lines.push('```');
+  }
+
   return [
     '',
     '<details>',
@@ -774,7 +813,7 @@ function renderFooter(entries) {
       : []),
     ...(hasCrttDistribution
       ? [
-          "<sub>The collapsed **CRTT drill-down** shows one line per chunk bucket: a sparkline of that bucket's RTT distribution over fixed log-scale bins (1-2-5 series, <1ms on the left to ≥5s on the right, normalized per line, `·` = empty bin) plus avg/p50/p90/p99. RTTs are aggregated inside the reader step on the deployment; the histograms and avgs merge exactly across iterations and runs, while p50-p99 are percentile-of-percentiles across iterations.</sub>",
+          "<sub>The collapsed **CRTT drill-down** shows one line per chunk bucket: a sparkline of that bucket's RTT distribution over fixed log-scale bins (1-2-5 series, <1ms on the left to ≥5s on the right, normalized per line, `·` = empty bin) plus avg/p50/p90/p99, and one progress line per variant (mean RTT per tenth of the stream — a rising staircase means chunks slow down as the stream grows). RTTs are aggregated inside the reader step on the deployment; histograms, avgs, and progress profiles merge exactly across iterations and runs, while p50-p99 are percentile-of-percentiles across iterations.</sub>",
           '',
         ]
       : []),

@@ -40,7 +40,9 @@
 import { createHook, getWorkflowMetadata, getWritable } from 'workflow';
 import { getRun } from 'workflow/api';
 import {
+  type BenchRttProgressProfile,
   type BenchRttSummary,
+  progressProfile,
   type RttIndexBucket,
   type RttSizeBucket,
   rttIndexBucket,
@@ -188,6 +190,9 @@ export interface BenchChunkRttResult {
   all?: BenchRttSummary;
   byIndex: Partial<Record<RttIndexBucket, BenchRttSummary>>;
   bySize: Partial<Record<RttSizeBucket, BenchRttSummary>>;
+  /** Mean RTT per tenth of the stream — the drift/trend readout that fixed
+   * index buckets cannot provide (see progressProfile in 97_bench_rtt.ts). */
+  progress: BenchRttProgressProfile;
 }
 
 // Pad lengths cycled by the CRTT `'sweep'` variant. With the ~50B base chunk
@@ -499,6 +504,10 @@ async function crttReaderStep(): Promise<BenchChunkRttResult> {
     await ready.close();
 
     const all: number[] = [];
+    // RTT per seq (indexed by the chunk's own seq, not arrival order) so the
+    // progress profile bins by position in the stream even if delivery ever
+    // reorders.
+    const rttBySeq: (number | undefined)[] = [];
     const byIndex = new Map<RttIndexBucket, number[]>();
     const bySize = new Map<RttSizeBucket, number[]>();
     let received = 0;
@@ -518,6 +527,7 @@ async function crttReaderStep(): Promise<BenchChunkRttResult> {
       const rtt = Math.max(0, receivedAt - chunk.writtenAt);
       const size = JSON.stringify(chunk).length;
       all.push(rtt);
+      rttBySeq[chunk.seq] = rtt;
       const push = <K>(map: Map<K, number[]>, key: K) => {
         const samples = map.get(key);
         if (samples) samples.push(rtt);
@@ -541,6 +551,7 @@ async function crttReaderStep(): Promise<BenchChunkRttResult> {
       all: summarizeRttSamples(all),
       byIndex: summarize(byIndex),
       bySize: summarize(bySize),
+      progress: progressProfile(rttBySeq),
     };
   } finally {
     reader.cancel().catch(() => {});

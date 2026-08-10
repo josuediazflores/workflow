@@ -11,9 +11,12 @@ import { describe, expect, test } from 'vitest';
 import {
   type BenchRttSummary,
   histogramRttSamples,
+  mergeProgressProfiles,
   mergeRttSummaries,
+  progressProfile,
   RTT_HIST_EDGES_MS,
   RTT_INDEX_BUCKETS,
+  RTT_PROGRESS_BINS,
   RTT_SIZE_BUCKETS,
   rttIndexBucket,
   rttSizeBucket,
@@ -32,20 +35,57 @@ function histWith(value: number, count = 1): number[] {
 }
 
 describe('rttIndexBucket', () => {
-  test('boundaries', () => {
+  test('boundaries: stream-open write / warmup / steady state', () => {
     expect(rttIndexBucket(0)).toBe('seq 0');
     expect(rttIndexBucket(1)).toBe('seq 1-20');
     expect(rttIndexBucket(20)).toBe('seq 1-20');
-    expect(rttIndexBucket(21)).toBe('seq 21-100');
-    expect(rttIndexBucket(100)).toBe('seq 21-100');
-    expect(rttIndexBucket(101)).toBe('seq 101+');
-    expect(rttIndexBucket(299)).toBe('seq 101+');
+    expect(rttIndexBucket(21)).toBe('seq 21+');
+    expect(rttIndexBucket(299)).toBe('seq 21+');
   });
 
   test('every bucket is a declared bucket key', () => {
     for (let seq = 0; seq < 300; seq++) {
       expect(RTT_INDEX_BUCKETS).toContain(rttIndexBucket(seq));
     }
+  });
+});
+
+describe('progressProfile', () => {
+  test('bins by fraction of the stream, so profiles are chunk-count independent', () => {
+    // 300 chunks: each tenth holds exactly 30.
+    const rtts = Array.from({ length: 300 }, (_, seq) => seq);
+    const profile = progressProfile(rtts);
+    expect(profile.counts).toEqual(new Array(RTT_PROGRESS_BINS).fill(30));
+    // First tenth: seq 0..29 (sum 435); last tenth: seq 270..299 (sum 8535).
+    expect(profile.totalMs[0]).toBe(435);
+    expect(profile.totalMs[RTT_PROGRESS_BINS - 1]).toBe(8535);
+
+    // 20 chunks (fewer than would fill 10 bins evenly at other counts): still
+    // 2 per tenth.
+    const small = progressProfile(Array.from({ length: 20 }, () => 5));
+    expect(small.counts).toEqual(new Array(RTT_PROGRESS_BINS).fill(2));
+  });
+
+  test('skips sparse entries defensively', () => {
+    const rtts: (number | undefined)[] = new Array(100);
+    rtts[0] = 7;
+    rtts[99] = 9;
+    const profile = progressProfile(rtts);
+    expect(profile.counts.reduce((a, b) => a + b, 0)).toBe(2);
+    expect(profile.totalMs[0]).toBe(7);
+    expect(profile.totalMs[RTT_PROGRESS_BINS - 1]).toBe(9);
+  });
+});
+
+describe('mergeProgressProfiles', () => {
+  test('returns undefined with no profiles and sums exactly otherwise', () => {
+    expect(mergeProgressProfiles([])).toBeUndefined();
+    expect(mergeProgressProfiles([undefined])).toBeUndefined();
+    const a = progressProfile(Array.from({ length: 10 }, () => 10));
+    const b = progressProfile(Array.from({ length: 10 }, () => 30));
+    const merged = mergeProgressProfiles([a, undefined, b]);
+    expect(merged?.counts).toEqual(new Array(RTT_PROGRESS_BINS).fill(2));
+    expect(merged?.totalMs).toEqual(new Array(RTT_PROGRESS_BINS).fill(40));
   });
 });
 
