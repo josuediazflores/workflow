@@ -100,16 +100,39 @@ different primary stores. vercel-py reads it in
 `_internal/workflow/worlds/vercel.py`. Production runs need nothing: the secret
 resolves to `''` on `main`, so both sides use `vercel-workflow.com`.
 
-That variable is about the *app* reaching the right store. The *driver* reaching
-it is a separate permission, and it is not set in this repo: the branch
-workflow-server (`e2e.vercel-workflow.com`) sits behind deployment protection,
-and a preview run's driver clears it with the workbench project's own identity.
-So `workbench-python-workflow` has to be listed in **that** project's Trusted
-Sources, alongside the JS workbench projects. Until it is, every driver write
-fails with `v4 createEvent: response missing required x-wf-* headers` and a
-`SyntaxError: Unexpected token '<'` — the HTML SSO page, not a workflow-server
-response. Production runs are unaffected: the secret is `''` on `main`, so the
-driver talks to `vercel-workflow.com`, which is not protected.
+That variable is about the *app* reaching the right store, and pointing it at the
+branch workflow-server (`e2e.vercel-workflow.com`) means clearing that server's
+deployment protection. Two callers need to, and they need it differently.
+
+The *driver* clears it with the workbench project's own identity, so
+`workbench-python-workflow` had to be listed in **that** project's Trusted
+Sources alongside the JS workbench projects. It now is: driver writes land, and
+runs are created. Before that, every write failed with `v4 createEvent: response
+missing required x-wf-* headers` and a `SyntaxError: Unexpected token '<'` — the
+HTML SSO page, not a workflow-server response.
+
+The *app* clears it with a header, and vercel-py does not send that header. This
+is what currently fails the lane. `getHttpConfig`
+(`packages/world-vercel/src/utils.ts:366`) sets both `Authorization: Bearer
+<oidc>` **and** `x-vercel-trusted-oidc-idp-token: <oidc>`; vercel-py's
+`_cbor_request` (`_internal/workflow/worlds/vercel.py:191`) sets only the first.
+Trusted Sources reads the second, so the very first call the workflow handler
+makes — `runs_get`, before any replay — comes back `302` to the SSO page:
+
+```
+HTTP Request: GET https://e2e.vercel-workflow.com/api/v2/runs/wrun_... "HTTP/1.1 302 Found"
+  File ".../worlds/vercel.py", line 219, in _cbor_request
+    result = resp.json()
+json.decoder.JSONDecodeError: Expecting value: line 1 column 1 (char 0)
+cbor2.CBORDecodeEOF: premature end of stream
+```
+
+`_cbor_request` also parses the body before checking the status, which is why a
+redirect surfaces as a CBOR decode error rather than as "you were redirected to
+a login page". Both need fixing upstream.
+
+Production runs are unaffected on both counts: the secret is `''` on `main`, so
+each side talks to `vercel-workflow.com`, which is not protected.
 
 CI reaches *this* deployment past deployment protection through the project's
 `trustedSources.oidcProviders` entry for `token.actions.githubusercontent.com`.
@@ -132,7 +155,7 @@ consumer path. Nothing in this repo could override either side without pinning
 the lane to a legacy spec version, which would have made the one lane testing
 the current protocol the one lane not testing it.
 
-vercel-py fixed it in two parts, which is why the pin below reaches for two
+vercel-py fixed it in two parts, which is why the pin reaches for two
 packages: `vercel-py#265` attaches a CBOR-with-JSON-fallback transport to the
 workflow topic, and `vercel-py#266` taught `Topic` / `TopicPattern` to carry a
 codec in the first place. Attaching it to the *subscription* rather than to a
@@ -140,6 +163,10 @@ client is what makes it work when deployed — the function that receives a push
 delivery is the builder-generated `_vc_queue_handlers/<name>.py`, whose
 `vercel.queue.asgi_app()` constructs its own `QueueClient` with no arguments, so
 a transport set on the world's client would never have been consulted.
+
+Confirmed fixed against a real deployment: on `36d5763a` the invoke payload
+decodes and the workflow handler runs, which is how the protection-header gap
+above became visible at all — it is the next call the handler makes.
 
 `world-local` was never affected — Python is producer and consumer there, so
 JSON on both ends is self-consistent.
