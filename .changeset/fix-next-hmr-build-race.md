@@ -2,4 +2,4 @@
 '@workflow/next': patch
 ---
 
-Preserve source changes made during a full development rebuild for the next HMR pass.
+Preserve source changes made during Next.js development rebuilds for the next HMR pass.

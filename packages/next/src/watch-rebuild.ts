@@ -1,4 +1,3 @@
-import { createHash } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
 
 export interface DiscoveredEntriesLike {
@@ -8,18 +7,11 @@ export interface DiscoveredEntriesLike {
   discoveredFiles?: Set<string>;
 }
 
-export interface FileChanges {
-  addedFiles: string[];
-  modifiedFiles: string[];
-  removedFiles: string[];
-}
-
 export type ScheduledRebuild =
-  | { kind: 'changes'; fileChanges: FileChanges }
+  | { kind: 'files'; files: string[] }
   | { kind: 'full' };
 
 export interface SourceSnapshot {
-  contentHash: string;
   importSignature: string;
   definitionSignature: string;
   hasDirective: boolean;
@@ -27,8 +19,7 @@ export interface SourceSnapshot {
 }
 
 export type RebuildDecision =
-  | { kind: 'ignored' }
-  | { kind: 'none'; snapshots: Map<string, SourceSnapshot> }
+  | { kind: 'skip'; snapshots: Map<string, SourceSnapshot> }
   | {
       kind: 'hot';
       refreshStepRegistrations: boolean;
@@ -223,7 +214,6 @@ export const createSourceSnapshotFromSource = (
   const patterns = detectWorkflowPatterns(sourceWithoutComments);
 
   return {
-    contentHash: createHash('sha256').update(source).digest('base64url'),
     importSignature: extractImportSignature(sourceWithoutComments),
     definitionSignature: extractDefinitionSignature(sourceWithoutComments),
     hasDirective: patterns.hasDirective,
@@ -262,20 +252,18 @@ export const getRelevantFiles = ({
     ].map(normalizePath)
   );
 
-export const replaceSourceSnapshots = async ({
+export const readSourceSnapshots = async ({
   discoveredEntries,
   inputFiles,
   normalizePath = defaultNormalizePath,
   readSnapshot,
-  sourceSnapshots,
 }: {
   discoveredEntries: DiscoveredEntriesLike;
   inputFiles: string[];
   normalizePath?: (path: string) => string;
   readSnapshot: (file: string) => Promise<SourceSnapshot>;
-  sourceSnapshots: Map<string, SourceSnapshot>;
 }) => {
-  sourceSnapshots.clear();
+  const snapshots = new Map<string, SourceSnapshot>();
   await Promise.all(
     [
       ...getRelevantFiles({
@@ -285,12 +273,11 @@ export const replaceSourceSnapshots = async ({
       }),
     ].map(async (file) => {
       try {
-        sourceSnapshots.set(file, await readSnapshot(file));
-      } catch {
-        sourceSnapshots.delete(file);
-      }
+        snapshots.set(file, await readSnapshot(file));
+      } catch {}
     })
   );
+  return snapshots;
 };
 
 const didSourceSnapshotChange = (
@@ -302,18 +289,7 @@ const didSourceSnapshotChange = (
   previousSnapshot.hasDirective !== nextSnapshot.hasDirective ||
   previousSnapshot.hasSerde !== nextSnapshot.hasSerde;
 
-const unique = (paths: string[]) => [...new Set(paths)];
-
-const mergeFileChanges = (
-  left: FileChanges,
-  right: FileChanges
-): FileChanges => ({
-  addedFiles: unique([...left.addedFiles, ...right.addedFiles]),
-  modifiedFiles: unique([...left.modifiedFiles, ...right.modifiedFiles]),
-  removedFiles: unique([...left.removedFiles, ...right.removedFiles]),
-});
-
-export const createFileChangeScheduler = (
+export const createRebuildScheduler = (
   rebuild: (request: ScheduledRebuild) => Promise<void>
 ) => {
   let pending: ScheduledRebuild | undefined;
@@ -340,18 +316,11 @@ export const createFileChangeScheduler = (
 
   return (request: ScheduledRebuild) => {
     switch (request.kind) {
-      case 'changes':
+      case 'files':
         if (pending?.kind !== 'full') {
           pending = {
-            kind: 'changes',
-            fileChanges: mergeFileChanges(
-              pending?.fileChanges ?? {
-                addedFiles: [],
-                modifiedFiles: [],
-                removedFiles: [],
-              },
-              request.fileChanges
-            ),
+            kind: 'files',
+            files: [...new Set([...(pending?.files ?? []), ...request.files])],
           };
         }
         break;
@@ -369,185 +338,6 @@ export const createFileChangeScheduler = (
       void flush();
     }, 100);
   };
-};
-
-const snapshotChangedFile = async ({
-  file,
-  nextSnapshots,
-  readSnapshot,
-  sourceSnapshots,
-}: {
-  file: string;
-  nextSnapshots: Map<string, SourceSnapshot>;
-  readSnapshot: (file: string) => Promise<SourceSnapshot>;
-  sourceSnapshots: Map<string, SourceSnapshot>;
-}) => {
-  const previousSnapshot = sourceSnapshots.get(file);
-  if (!previousSnapshot) {
-    return false;
-  }
-
-  const nextSnapshot = await readSnapshot(file);
-  if (didSourceSnapshotChange(previousSnapshot, nextSnapshot)) {
-    return false;
-  }
-
-  if (previousSnapshot.contentHash !== nextSnapshot.contentHash) {
-    nextSnapshots.set(file, nextSnapshot);
-  }
-  return true;
-};
-
-const removedFilesRequireFullRebuild = ({
-  discoveredEntries,
-  inputFiles,
-  normalizePath,
-  removedFiles,
-}: {
-  discoveredEntries: DiscoveredEntriesLike;
-  inputFiles: string[];
-  normalizePath: (path: string) => string;
-  removedFiles: string[];
-}) => {
-  const relevantFiles = getRelevantFiles({
-    discoveredEntries,
-    inputFiles,
-    normalizePath,
-  });
-  return removedFiles.some((file) => relevantFiles.has(file));
-};
-
-const addedFilesRequireFullRebuild = async ({
-  addedFiles,
-  readSnapshot,
-}: {
-  addedFiles: string[];
-  readSnapshot: (file: string) => Promise<SourceSnapshot>;
-}) => {
-  for (const file of addedFiles) {
-    try {
-      const snapshot = await readSnapshot(file);
-      if (snapshot.hasDirective || snapshot.hasSerde) {
-        return true;
-      }
-    } catch {
-      return true;
-    }
-  }
-  return false;
-};
-
-const pruneStaleAddedFiles = async ({
-  addedFiles,
-  readSnapshot,
-  sourceSnapshots,
-}: {
-  addedFiles: string[];
-  readSnapshot: (file: string) => Promise<SourceSnapshot>;
-  sourceSnapshots: Map<string, SourceSnapshot>;
-}) => {
-  const nextAddedFiles: string[] = [];
-  const modifiedFiles: string[] = [];
-
-  for (const file of unique(addedFiles)) {
-    const previousSnapshot = sourceSnapshots.get(file);
-    if (!previousSnapshot) {
-      nextAddedFiles.push(file);
-      continue;
-    }
-
-    try {
-      const nextSnapshot = await readSnapshot(file);
-      if (previousSnapshot.contentHash !== nextSnapshot.contentHash) {
-        modifiedFiles.push(file);
-      }
-    } catch {
-      nextAddedFiles.push(file);
-    }
-  }
-
-  return { addedFiles: nextAddedFiles, modifiedFiles };
-};
-
-const modifiedFilesRequireFullRebuild = async ({
-  modifiedFiles,
-  readSnapshot,
-  sourceSnapshots,
-}: {
-  modifiedFiles: string[];
-  readSnapshot: (file: string) => Promise<SourceSnapshot>;
-  sourceSnapshots: Map<string, SourceSnapshot>;
-}) => {
-  for (const file of unique(modifiedFiles)) {
-    try {
-      const nextSnapshot = await readSnapshot(file);
-      const previousSnapshot = sourceSnapshots.get(file);
-      if (!previousSnapshot) {
-        if (
-          nextSnapshot.importSignature ||
-          nextSnapshot.definitionSignature ||
-          nextSnapshot.hasDirective ||
-          nextSnapshot.hasSerde
-        ) {
-          return true;
-        }
-        continue;
-      }
-      if (didSourceSnapshotChange(previousSnapshot, nextSnapshot)) {
-        return true;
-      }
-    } catch {
-      return true;
-    }
-  }
-  return false;
-};
-
-const getChangedRelevantFiles = ({
-  discoveredEntries,
-  fileChanges,
-  inputFiles,
-  normalizePath,
-}: {
-  discoveredEntries: DiscoveredEntriesLike;
-  fileChanges: FileChanges;
-  inputFiles: string[];
-  normalizePath: (path: string) => string;
-}) => {
-  const relevantFiles = getRelevantFiles({
-    discoveredEntries,
-    inputFiles,
-    normalizePath,
-  });
-  return unique([
-    ...fileChanges.addedFiles,
-    ...fileChanges.modifiedFiles,
-  ]).filter((file) => relevantFiles.has(file));
-};
-
-const collectHotRebuildSnapshots = async ({
-  changedFiles,
-  readSnapshot,
-  sourceSnapshots,
-}: {
-  changedFiles: string[];
-  readSnapshot: (file: string) => Promise<SourceSnapshot>;
-  sourceSnapshots: Map<string, SourceSnapshot>;
-}) => {
-  const snapshots = new Map<string, SourceSnapshot>();
-  for (const file of changedFiles) {
-    if (
-      !(await snapshotChangedFile({
-        file,
-        nextSnapshots: snapshots,
-        readSnapshot,
-        sourceSnapshots,
-      }))
-    ) {
-      return;
-    }
-  }
-  return snapshots;
 };
 
 const workflowEntryFilesChanged = ({
@@ -604,16 +394,16 @@ const stepRegistrationsNeedRefresh = ({
 };
 
 export const classifyRebuild = async ({
+  files,
   discoveredEntries,
-  fileChanges,
   inputFiles,
   normalizePath = defaultNormalizePath,
   parentHasChild,
   readSnapshot,
   sourceSnapshots,
 }: {
+  files: string[];
   discoveredEntries: DiscoveredEntriesLike;
-  fileChanges: FileChanges;
   inputFiles: string[];
   normalizePath?: (path: string) => string;
   parentHasChild: (
@@ -624,79 +414,56 @@ export const classifyRebuild = async ({
   readSnapshot: (file: string) => Promise<SourceSnapshot>;
   sourceSnapshots: Map<string, SourceSnapshot>;
 }): Promise<RebuildDecision> => {
-  const prunedAddedFiles = await pruneStaleAddedFiles({
-    addedFiles: fileChanges.addedFiles,
-    readSnapshot,
-    sourceSnapshots,
-  });
-  const normalizedFileChanges = {
-    ...fileChanges,
-    addedFiles: prunedAddedFiles.addedFiles,
-    modifiedFiles: unique([
-      ...fileChanges.modifiedFiles,
-      ...prunedAddedFiles.modifiedFiles,
-    ]),
-  };
-
-  if (
-    removedFilesRequireFullRebuild({
-      discoveredEntries,
-      inputFiles,
-      normalizePath,
-      removedFiles: normalizedFileChanges.removedFiles,
-    }) ||
-    (await addedFilesRequireFullRebuild({
-      addedFiles: normalizedFileChanges.addedFiles,
-      readSnapshot,
-    })) ||
-    (await modifiedFilesRequireFullRebuild({
-      modifiedFiles: normalizedFileChanges.modifiedFiles,
-      readSnapshot,
-      sourceSnapshots,
-    }))
-  ) {
-    return { kind: 'full' };
-  }
-
-  const changedRelevantFiles = getChangedRelevantFiles({
+  const relevantFiles = getRelevantFiles({
     discoveredEntries,
-    fileChanges: normalizedFileChanges,
     inputFiles,
     normalizePath,
   });
-  if (changedRelevantFiles.length === 0) {
-    return { kind: 'ignored' };
-  }
+  const snapshots = new Map<string, SourceSnapshot>();
+  for (const file of files) {
+    let nextSnapshot: SourceSnapshot;
+    try {
+      nextSnapshot = await readSnapshot(file);
+    } catch {
+      if (relevantFiles.has(file)) {
+        return { kind: 'full' };
+      }
+      continue;
+    }
 
-  try {
-    const snapshots = await collectHotRebuildSnapshots({
-      changedFiles: changedRelevantFiles,
-      readSnapshot,
-      sourceSnapshots,
-    });
-    if (!snapshots) {
+    const previousSnapshot = sourceSnapshots.get(file);
+    if (!previousSnapshot) {
+      if (
+        relevantFiles.has(file) ||
+        nextSnapshot.importSignature ||
+        nextSnapshot.hasDirective ||
+        nextSnapshot.hasSerde
+      ) {
+        return { kind: 'full' };
+      }
+      continue;
+    }
+    if (didSourceSnapshotChange(previousSnapshot, nextSnapshot)) {
       return { kind: 'full' };
     }
-    if (snapshots.size === 0) {
-      return { kind: 'ignored' };
-    }
-    return workflowEntryFilesChanged({
-      changedFiles: changedRelevantFiles,
-      discoveredEntries,
-      normalizePath,
-      parentHasChild,
-    })
-      ? {
-          kind: 'hot',
-          refreshStepRegistrations: stepRegistrationsNeedRefresh({
-            changedFiles: changedRelevantFiles,
-            discoveredEntries,
-            normalizePath,
-          }),
-          snapshots,
-        }
-      : { kind: 'none', snapshots };
-  } catch {
-    return { kind: 'full' };
+    snapshots.set(file, nextSnapshot);
   }
+
+  const changedFiles = [...snapshots.keys()];
+  return workflowEntryFilesChanged({
+    changedFiles,
+    discoveredEntries,
+    normalizePath,
+    parentHasChild,
+  })
+    ? {
+        kind: 'hot',
+        refreshStepRegistrations: stepRegistrationsNeedRefresh({
+          changedFiles,
+          discoveredEntries,
+          normalizePath,
+        }),
+        snapshots,
+      }
+    : { kind: 'skip', snapshots };
 };

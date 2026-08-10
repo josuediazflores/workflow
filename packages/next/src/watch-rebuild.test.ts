@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, test, vi } from 'vitest';
 import {
   classifyRebuild,
-  createFileChangeScheduler,
+  createRebuildScheduler,
   createSourceSnapshotFromSource,
   extractImportSignature,
   type SourceSnapshot,
@@ -16,76 +16,51 @@ describe('watch-rebuild scheduling', () => {
   test('merges changes until filesystem writes become quiet', async () => {
     vi.useFakeTimers();
     const rebuild = vi.fn(async () => {});
-    const schedule = createFileChangeScheduler(rebuild);
+    const schedule = createRebuildScheduler(rebuild);
 
     schedule({
-      kind: 'changes',
-      fileChanges: {
-        addedFiles: [],
-        modifiedFiles: ['/app/workflow.ts'],
-        removedFiles: [],
-      },
+      kind: 'files',
+      files: ['/app/workflow.ts'],
     });
     await vi.advanceTimersByTimeAsync(99);
     schedule({
-      kind: 'changes',
-      fileChanges: {
-        addedFiles: ['/app/helper.ts'],
-        modifiedFiles: [],
-        removedFiles: [],
-      },
+      kind: 'files',
+      files: ['/app/helper.ts'],
     });
     await vi.advanceTimersByTimeAsync(99);
 
     expect(rebuild).not.toHaveBeenCalled();
     await vi.advanceTimersByTimeAsync(1);
     expect(rebuild).toHaveBeenCalledWith({
-      kind: 'changes',
-      fileChanges: {
-        addedFiles: ['/app/helper.ts'],
-        modifiedFiles: ['/app/workflow.ts'],
-        removedFiles: [],
-      },
+      kind: 'files',
+      files: ['/app/workflow.ts', '/app/helper.ts'],
     });
   });
 
   test('collapses full rebuild requests while a rebuild runs', async () => {
     vi.useFakeTimers();
-    let finishFirstBuild!: () => void;
-    const firstBuild = new Promise<void>((resolve) => {
-      finishFirstBuild = resolve;
-    });
-    let reportFullBuild!: () => void;
-    const fullBuild = new Promise<void>((resolve) => {
-      reportFullBuild = resolve;
-    });
+    const firstBuild = Promise.withResolvers<void>();
+    const fullBuild = Promise.withResolvers<void>();
     const requests: string[] = [];
-    const schedule = createFileChangeScheduler(async (request) => {
+    const schedule = createRebuildScheduler(async (request) => {
       requests.push(request.kind);
       if (requests.length === 1) {
-        await firstBuild;
+        await firstBuild.promise;
       } else {
-        reportFullBuild();
+        fullBuild.resolve();
       }
     });
 
-    schedule({
-      kind: 'changes',
-      fileChanges: {
-        addedFiles: [],
-        modifiedFiles: ['/app/workflow.ts'],
-        removedFiles: [],
-      },
-    });
+    schedule({ kind: 'full' });
     await vi.advanceTimersByTimeAsync(100);
 
     schedule({ kind: 'full' });
     schedule({ kind: 'full' });
     await vi.advanceTimersByTimeAsync(100);
-    finishFirstBuild();
-    await fullBuild;
+    firstBuild.resolve();
+    await fullBuild.promise;
 
-    expect(requests).toEqual(['changes', 'full']);
+    expect(requests).toEqual(['full', 'full']);
   });
 });
 
@@ -121,18 +96,6 @@ import * as active from './workflows/active';
 `);
 
     expect(extractImportSignature(source)).toBe('./workflows/active');
-  });
-
-  test('includes comments in the content hash', () => {
-    const source = 'const value = /* @__PURE__ */ createValue();';
-    const changedSource = 'const value = /* @__NOPE__ */ createValue();';
-
-    expect(
-      createSourceSnapshotFromSource(source, detectWorkflowPatterns).contentHash
-    ).not.toBe(
-      createSourceSnapshotFromSource(changedSource, detectWorkflowPatterns)
-        .contentHash
-    );
   });
 
   test('ignores workflow definitions inside comments', () => {
@@ -194,11 +157,7 @@ export const allWorkflows = {
           discoveredSerdeFiles: new Set(),
           discoveredFiles: new Set([pageFile, registryFile, workflowFile]),
         },
-        fileChanges: {
-          addedFiles: [],
-          modifiedFiles: [registryFile],
-          removedFiles: [],
-        },
+        files: [registryFile],
         inputFiles: [pageFile],
         parentHasChild: () => false,
         readSnapshot: async (file) =>
@@ -228,11 +187,7 @@ export const allWorkflows = {} as const;
           discoveredSerdeFiles: new Set(),
           discoveredFiles: new Set([registryFile]),
         },
-        fileChanges: {
-          addedFiles: [stepFile],
-          modifiedFiles: [registryFile],
-          removedFiles: [],
-        },
+        files: [stepFile, registryFile],
         inputFiles: [registryFile],
         parentHasChild: () => false,
         readSnapshot: async (file) =>
@@ -245,44 +200,39 @@ export const allWorkflows = {} as const;
     ).resolves.toEqual({ kind: 'full' });
   });
 
-  test('ignores stale add events for already snapshotted files', async () => {
-    const stepFile = '/app/workflows/hmr-fuzz-step.ts';
-    const pageFile = '/app/app/page.tsx';
-    const stepSource = `export async function hmrFuzzStep() {
-  'use step';
-  return 'step-value';
+  test('rebuilds stale workflow notifications', async () => {
+    const workflowFile = '/app/workflows/example.ts';
+    const source = `export async function example() {
+  'use workflow';
 }
 `;
-    const sourceSnapshots = new Map<string, SourceSnapshot>([
-      [
-        stepFile,
-        createSourceSnapshotFromSource(stepSource, detectWorkflowPatterns),
-      ],
-    ]);
+    const snapshot = createSourceSnapshotFromSource(
+      source,
+      detectWorkflowPatterns
+    );
 
     const decision = await classifyRebuild({
       discoveredEntries: {
-        discoveredSteps: new Set([stepFile]),
-        discoveredWorkflows: new Set(),
+        discoveredSteps: new Set(),
+        discoveredWorkflows: new Set([workflowFile]),
         discoveredSerdeFiles: new Set(),
-        discoveredFiles: new Set([pageFile, stepFile]),
+        discoveredFiles: new Set([workflowFile]),
       },
-      fileChanges: {
-        addedFiles: [stepFile],
-        modifiedFiles: [],
-        removedFiles: [],
-      },
-      inputFiles: [pageFile],
+      files: [workflowFile],
+      inputFiles: [workflowFile],
       parentHasChild: () => false,
-      readSnapshot: async () =>
-        createSourceSnapshotFromSource(stepSource, detectWorkflowPatterns),
-      sourceSnapshots,
+      readSnapshot: async () => snapshot,
+      sourceSnapshots: new Map([[workflowFile, snapshot]]),
     });
 
-    expect(decision).toEqual({ kind: 'ignored' });
+    expect(decision).toEqual({
+      kind: 'hot',
+      refreshStepRegistrations: false,
+      snapshots: new Map([[workflowFile, snapshot]]),
+    });
   });
 
-  test('rebuilds relevant added files without snapshots', async () => {
+  test('rebuilds relevant files without snapshots', async () => {
     const helperFile = '/app/workflows/helper.ts';
 
     await expect(
@@ -293,11 +243,7 @@ export const allWorkflows = {} as const;
           discoveredSerdeFiles: new Set(),
           discoveredFiles: new Set([helperFile]),
         },
-        fileChanges: {
-          addedFiles: [helperFile],
-          modifiedFiles: [],
-          removedFiles: [],
-        },
+        files: [helperFile],
         inputFiles: [],
         parentHasChild: () => false,
         readSnapshot: async () =>
@@ -310,39 +256,31 @@ export const allWorkflows = {} as const;
     ).resolves.toEqual({ kind: 'full' });
   });
 
-  test('ignores byte-identical modified files', async () => {
-    const workflowFile = '/app/workflows/example.ts';
-    const source = `export async function example() {
-  'use workflow';
-}
-`;
-    const snapshot = createSourceSnapshotFromSource(
-      source,
-      detectWorkflowPatterns
-    );
+  test('rebuilds new files that can introduce graph entries', async () => {
+    const routeFile = '/app/app/new/route.ts';
 
     await expect(
       classifyRebuild({
         discoveredEntries: {
           discoveredSteps: new Set(),
-          discoveredWorkflows: new Set([workflowFile]),
+          discoveredWorkflows: new Set(),
           discoveredSerdeFiles: new Set(),
-          discoveredFiles: new Set([workflowFile]),
+          discoveredFiles: new Set(),
         },
-        fileChanges: {
-          addedFiles: [],
-          modifiedFiles: [workflowFile],
-          removedFiles: [],
-        },
-        inputFiles: [workflowFile],
+        files: [routeFile],
+        inputFiles: [],
         parentHasChild: () => false,
-        readSnapshot: async () => snapshot,
-        sourceSnapshots: new Map([[workflowFile, snapshot]]),
+        readSnapshot: async () =>
+          createSourceSnapshotFromSource(
+            "import './workflow';\n",
+            detectWorkflowPatterns
+          ),
+        sourceSnapshots: new Map(),
       })
-    ).resolves.toEqual({ kind: 'ignored' });
+    ).resolves.toEqual({ kind: 'full' });
   });
 
-  test('rebuilds changed stale adds used by workflows', async () => {
+  test('hot rebuilds body changes used by workflows', async () => {
     const helperFile = '/app/workflows/helper.ts';
     const workflowFile = '/app/workflows/workflow.ts';
     const previousHelperSnapshot = createSourceSnapshotFromSource(
@@ -353,14 +291,6 @@ export const allWorkflows = {} as const;
       "export const value = 'after';\n",
       detectWorkflowPatterns
     );
-    const workflowSnapshot = createSourceSnapshotFromSource(
-      `export async function workflow() {
-  'use workflow';
-}
-`,
-      detectWorkflowPatterns
-    );
-
     await expect(
       classifyRebuild({
         discoveredEntries: {
@@ -369,27 +299,12 @@ export const allWorkflows = {} as const;
           discoveredSerdeFiles: new Set(),
           discoveredFiles: new Set([helperFile, workflowFile]),
         },
-        fileChanges: {
-          addedFiles: [helperFile],
-          modifiedFiles: [workflowFile],
-          removedFiles: [],
-        },
+        files: [helperFile],
         inputFiles: [workflowFile],
         parentHasChild: (parent, child) =>
           parent === workflowFile && child === helperFile,
-        readSnapshot: async (file) => {
-          if (file === helperFile) {
-            return nextHelperSnapshot;
-          }
-          if (file === workflowFile) {
-            return workflowSnapshot;
-          }
-          throw new Error(`Unexpected file: ${file}`);
-        },
-        sourceSnapshots: new Map([
-          [helperFile, previousHelperSnapshot],
-          [workflowFile, workflowSnapshot],
-        ]),
+        readSnapshot: async () => nextHelperSnapshot,
+        sourceSnapshots: new Map([[helperFile, previousHelperSnapshot]]),
       })
     ).resolves.toEqual({
       kind: 'hot',
