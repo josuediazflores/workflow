@@ -52,6 +52,11 @@ const METRIC_LABELS = {
     description:
       'stream overhead (end-to-end write+consume time beyond the modelled generation window)',
   },
+  // Naming: CRTT (chunk ROUND-trip time) is reserved for this bench's
+  // same-clock-domain measurement — the chunk returns to the deployment that
+  // stamped it. The future production write→read metric crosses clocks and is
+  // a one-way trip: name that one CTT (chunk trip time), a separate metric id
+  // with its own skew caveats, so the two never collide.
   crtt: {
     name: 'CRTT',
     description:
@@ -786,9 +791,18 @@ function buildTargetsLegend(results) {
 
 function renderFooter(entries) {
   const results = entries.flatMap((entry) => entry.results ?? []);
-  const definitions = METRIC_ORDER.map(
-    (id) => `**${METRIC_LABELS[id].name}**: ${METRIC_LABELS[id].description}`
-  ).join(' · ');
+  // Only define the metrics this comment actually shows — retired metrics
+  // (e.g. SL/SO, superseded by CRTT) stay defined in METRIC_LABELS so older
+  // history entries keep rendering, but they drop out of the legend once the
+  // latest run no longer reports them.
+  const presentMetrics = new Set(
+    results.flatMap((result) => (result.metrics ?? []).map((row) => row.metric))
+  );
+  const definitions = METRIC_ORDER.filter((id) => presentMetrics.has(id))
+    .map(
+      (id) => `**${METRIC_LABELS[id].name}**: ${METRIC_LABELS[id].description}`
+    )
+    .join(' · ');
   const scenarioLegend = buildScenarioLegend(results);
   const targetsLegend = buildTargetsLegend(results);
   const hasBaseline = results.some((result) =>
@@ -841,7 +855,7 @@ function renderFooter(entries) {
         ]
       : []),
     '',
-    '<sub>All metrics are measured from deployment-side timestamps only. Runs are triggered by an in-deployment route that stamps the anchor (`clientStart`) right before `start()`, so the CI runner’s request and its path through api.vercel.com sit outside every measured window. TTFS = in-deployment `start()` → first step body (turbo uses the in-process fast path, non-turbo the dispatch path), and includes the VQS dispatch hop plus any `/flow` cold start. STSO/WO are measured between step bodies on the deployment. SL is measured inside the workflow (parallel reader/writer steps), so it no longer includes the api.vercel.com read path.</sub>',
+    '<sub>All metrics are measured from deployment-side timestamps only. Runs are triggered by an in-deployment route that stamps the anchor (`clientStart`) right before `start()`, so the CI runner’s request and its path through api.vercel.com sit outside every measured window. TTFS = in-deployment `start()` → first step body (turbo uses the in-process fast path, non-turbo the dispatch path), and includes the VQS dispatch hop plus any `/flow` cold start. STSO/WO are measured between step bodies on the deployment. CRTT is measured inside the workflow (parallel reader/writer steps), so it does not include the api.vercel.com read path.</sub>',
     '',
     '<sub>Cold starts are kept in the numbers on purpose — they are part of real bursty-workload latency. The workbench deployment cold-starts the `/flow` invocation for a large fraction of runs, inflating P75+; the **Best** column shows the fastest (warm-start) sample for comparison.</sub>',
   ];

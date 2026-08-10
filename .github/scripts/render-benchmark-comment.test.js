@@ -590,8 +590,13 @@ test('renders the CRTT drill-down as a sparkline matrix', async () => {
   assert.match(body, /llm {2}▁[▁▂▃▄▅▆▇█]{8}█ {2}110–135ms/);
   assert.match(body, /RTT by chunk size \(avg per log size bin/);
   assert.match(body, /sweep {2}▁[▁▂▃▄▅▆▇█]{4}█· {2}118–126ms/);
-  // Footer smallprint explains the sparklines.
+  // Footer smallprint explains the sparklines, and the metric-definitions
+  // legend only lists metrics present in this run — no retired SL/SO entries
+  // on a CRTT-only result.
   assert.match(body, /<sub>The collapsed \*\*CRTT drill-down\*\* shows one/);
+  assert.match(body, /\*\*CRTT\*\*: chunk round-trip time/);
+  assert.doesNotMatch(body, /\*\*SL\*\*: stream latency/);
+  assert.doesNotMatch(body, /\*\*SO\*\*: stream overhead/);
   // Histograms and progress profiles are stripped from the embedded history
   // data block, like raw samples (the artifacts keep them; only the comment
   // payload slims down).

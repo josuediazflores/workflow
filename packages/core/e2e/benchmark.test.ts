@@ -44,32 +44,28 @@
  *          `(lastStep.end - clientStart) - Σ(step durations)`. Measured on the
  *          sequential scenario only — on a single-step workflow WO reduces
  *          algebraically to TTFS.
- * - SL    (stream latency): live write->read propagation for the default
- *          output stream, measured entirely on the deployment by
- *          `benchSlWorkflow`: a reader step and a writer step run in parallel,
- *          the reader blocks on the first chunk, and the workflow returns both
- *          the writer's `writtenAt` and the reader's `readAt`. SL is
- *          `readAt - writtenAt`, so it excludes the api.vercel.com read path
- *          the old client-observed metric included.
- * - SO    (stream overhead): end-to-end write+consume time in excess of a
- *          modelled generation window, measured on the deployment by
- *          `benchSoWorkflow`. A writer streams deterministic variable-length
- *          LLM-token deltas at a fixed rate for a fixed duration while a
- *          parallel reader drains the whole stream; SO is
- *          `(doneAt - writtenAt) - chunkCount*intervalMs`, i.e. the
- *          overhead/backpressure the stream adds on top of the token rate. Same
- *          setup as SL, but the reader stamps `doneAt` after the last chunk
- *          rather than `readAt` on the first. Measured for two payload shapes
- *          (raw text vs AI-SDK-style structured deltas) so the SO delta between
- *          them isolates serialization cost.
- * - CRTT  (chunk round-trip time): per-chunk write->read latency for the same
- *          paced LLM-shaped stream, measured on the deployment by
+ * - CRTT  (chunk round-trip time): per-chunk write->read latency for a paced
+ *          LLM-shaped stream, measured on the deployment by
  *          `benchCrttWorkflow`. The "round trip" is deployment -> stream
  *          backend -> reader on the same deployment (which is what keeps both
  *          timestamps on one clock domain) — not an echo back to the writer.
- *          Every delta embeds `{ seq, writtenAt }` (the SL scenario's
- *          payload-embedded-timestamp trick applied to every chunk) and the
- *          reader stamps each chunk's arrival. Samples are aggregated INSIDE
+ *          NAMING: CRTT is reserved for exactly this same-clock-domain
+ *          measurement; the future production write->read metric crosses
+ *          clocks (producer deployment -> arbitrary consumer) and is a
+ *          one-way trip — that one is CTT (chunk trip time), reported
+ *          separately with clock-skew caveats. Keep the names distinct.
+ *          Every delta embeds `{ seq, writtenAt }` (a payload-embedded
+ *          timestamp) and the reader stamps each chunk's arrival; writer and
+ *          reader steps run in parallel on a dedicated namespaced stream,
+ *          coordinated by a reader-ready barrier so chunk 0 is a live
+ *          delivery, not a retained-chunk catch-up. CRTT subsumes the retired
+ *          SL and SO report rows: SL (first-chunk propagation) is CRTT's
+ *          seq-0 slice, and SO (whole-stream makespan excess) reduces to the
+ *          last chunk's RTT plus stall accumulation — per-chunk aggregation
+ *          reports the same pipe with 100x the samples and mean-type
+ *          stability (the benchSlWorkflow/benchSoWorkflow workflows still
+ *          exist in 97_bench.ts; this runner just no longer runs them).
+ *          Samples are aggregated INSIDE
  *          the reader step into chunk-index buckets (seq 0 = stream-open
  *          write / seq 1-20 = warmup / seq 21+ = steady state), a fixed
  *          log-bin histogram per bucket, and two mean-RTT profiles: per tenth
@@ -92,10 +88,7 @@
  * 2. benchStreamWorkflow          — 1 streaming step, turbo mode → TTFS (turbo)
  * 3. benchHookStreamWorkflow      — hook + 1 step, non-turbo → TTFS (non-turbo)
  * 4. benchSequentialStepsWorkflow — 1020 trivial sequential steps → STSO + WO
- * 5. benchSlWorkflow              — parallel reader/writer steps → SL
- * 6. benchSoWorkflow              — paced LLM-shaped stream, drained → SO
- *                                   (run in text and structured payload modes)
- * 7. benchCrttWorkflow            — paced stream of self-timestamping chunks →
+ * 5. benchCrttWorkflow            — paced stream of self-timestamping chunks →
  *                                   CRTT (run in llm-shaped and size-sweep
  *                                   variants)
  *
@@ -104,9 +97,9 @@
  *
  * The backend is selected exactly like the e2e tests (setupWorld): Vercel when
  * WORKFLOW_VERCEL_ENV is set, Postgres when WORKFLOW_TARGET_WORLD is
- * @workflow/world-postgres, local filesystem otherwise. Because SL is now
- * measured inside the workflow (not by a reader in this process), it no longer
- * depends on `run.getReadable()` working across processes; CI still runs this
+ * @workflow/world-postgres, local filesystem otherwise. CRTT is measured
+ * inside the workflow (not by a reader in this process), so it does not
+ * depend on `run.getReadable()` working across processes; CI still runs this
  * file against Vercel only.
  *
  * All timestamps are deployment-side, so the only residual skew is intra-Vercel
@@ -146,14 +139,12 @@ const envInt = (name: string, fallback: number, min = 1): number => {
   return value;
 };
 
-// Iteration counts. The stream/hook/SL scenarios yield one sample per
+// Iteration counts. The stream/hook scenarios yield one sample per
 // iteration; the sequential scenario yields (stepCount - 1) STSO samples per
 // iteration, so a single long run already provides solid percentiles.
 const STREAM_ITERATIONS = envInt('BENCH_STREAM_ITERATIONS', 30);
-const SL_ITERATIONS = envInt('BENCH_SL_ITERATIONS', STREAM_ITERATIONS);
-const SO_ITERATIONS = envInt('BENCH_SO_ITERATIONS', STREAM_ITERATIONS);
 // Each CRTT iteration yields one RTT sample per chunk (300 by default), so
-// fewer iterations than SO already give thousands of samples per bucket.
+// few iterations already give thousands of samples per bucket.
 const CRTT_ITERATIONS = envInt('BENCH_CRTT_ITERATIONS', 10);
 const SEQUENTIAL_ITERATIONS = envInt('BENCH_SEQUENTIAL_ITERATIONS', 1);
 const SEQUENTIAL_STEP_COUNT = envInt('BENCH_SEQUENTIAL_STEP_COUNT', 1020);
@@ -171,21 +162,17 @@ const BENCH_METHODOLOGY_VERSION = 2;
 // Provisional: now that the proxy leg is out of every window, these will be
 // re-tightened once a few in-deployment baselines land.
 const TTFS_TARGETS = { p75: 200, p90: 300, p99: 600 };
-const SL_TARGETS = { p75: 50, p90: 60, p99: 125 };
 
-// SO scenario: model a haiku-size LLM streaming tokens — ~100 tokens/sec, each
-// token a 4-byte chunk, for 3 seconds (300 chunks). The writer paces itself so
-// the write phase spans exactly `SO_CHUNK_COUNT * SO_INTERVAL_MS` ms; SO is the
-// end-to-end write+consume time beyond that window (see runSoIteration). These
-// derive `SO_NOMINAL_DURATION_MS`, the single value subtracted from the
-// measured span, so the workflow's write span and the subtraction never drift.
-const SO_CHUNK_RATE_PER_SEC = envInt('BENCH_SO_CHUNK_RATE', 100);
-const SO_DURATION_SECONDS = envInt('BENCH_SO_DURATION_SECONDS', 3);
-const SO_CHUNK_COUNT = SO_CHUNK_RATE_PER_SEC * SO_DURATION_SECONDS;
-const SO_INTERVAL_MS = 1000 / SO_CHUNK_RATE_PER_SEC;
-const SO_NOMINAL_DURATION_MS = SO_CHUNK_COUNT * SO_INTERVAL_MS;
-// Provisional, like TTFS/SL above: re-tighten once in-deployment baselines land.
-const SO_TARGETS = { p75: 250, p90: 500, p99: 1000 };
+// CRTT workload: model a haiku-size LLM streaming tokens — ~100 tokens/sec
+// for 3 seconds (300 chunks). The writer paces itself so the write phase
+// spans exactly `CRTT_CHUNK_COUNT * CRTT_INTERVAL_MS` ms; the run-completion
+// guard extends past the base timeout by `CRTT_NOMINAL_DURATION_MS`, the
+// modelled generation window.
+const CRTT_CHUNK_RATE_PER_SEC = envInt('BENCH_CRTT_CHUNK_RATE', 100);
+const CRTT_DURATION_SECONDS = envInt('BENCH_CRTT_DURATION_SECONDS', 3);
+const CRTT_CHUNK_COUNT = CRTT_CHUNK_RATE_PER_SEC * CRTT_DURATION_SECONDS;
+const CRTT_INTERVAL_MS = 1000 / CRTT_CHUNK_RATE_PER_SEC;
+const CRTT_NOMINAL_DURATION_MS = CRTT_CHUNK_COUNT * CRTT_INTERVAL_MS;
 
 // Guard timeouts so a single stuck run fails fast instead of eating the job.
 const RUN_TIMEOUT_MS = envInt('BENCH_RUN_TIMEOUT_MS', 120_000);
@@ -211,17 +198,6 @@ interface BenchStepTiming {
   kind: 'inline' | 'queue-hop';
 }
 
-interface BenchStreamLatency {
-  writtenAt: number;
-  readAt: number;
-}
-
-interface BenchStreamOverhead {
-  writtenAt: number;
-  doneAt: number;
-  received: number;
-}
-
 interface StreamIterationResult {
   runId: string;
   /** `steps[0].start - clientStart`, both deployment-side clocks. */
@@ -242,18 +218,6 @@ interface SequentialIterationResult {
   stsoQueueHopMs: number[];
   /** Whole-run workflow overhead, anchored on the in-deployment clientStart. */
   woMs: number;
-}
-
-interface SlIterationResult {
-  runId: string;
-  /** `readAt - writtenAt`, both deployment-side step-body clocks. */
-  slMs: number;
-}
-
-interface SoIterationResult {
-  runId: string;
-  /** `(doneAt - writtenAt) - SO_NOMINAL_DURATION_MS`, deployment-side clocks. */
-  soMs: number;
 }
 
 /** Mirrors BenchChunkRttResult in workflows/97_bench.ts: per-bucket RTT
@@ -441,82 +405,12 @@ async function runSequentialIteration(
   }
 }
 
-async function runSlIteration(): Promise<SlIterationResult> {
-  const { runId } = await triggerBenchRun('benchSlWorkflow');
-  try {
-    const returnValue = await withTimeout(
-      getReturnValue(runId),
-      RUN_TIMEOUT_MS,
-      `benchSlWorkflow returnValue (run ${runId})`
-    );
-    const sl = (returnValue as { sl?: BenchStreamLatency } | undefined)?.sl;
-    if (
-      !sl ||
-      typeof sl.writtenAt !== 'number' ||
-      typeof sl.readAt !== 'number'
-    ) {
-      throw new Error(
-        `Run ${runId} returned no stream-latency sample: ${JSON.stringify(returnValue)?.slice(0, 200)}`
-      );
-    }
-    return { runId, slMs: Math.max(0, sl.readAt - sl.writtenAt) };
-  } catch (error) {
-    (error as Error).message += ` (run ${runId})`;
-    throw error;
-  }
-}
-
-async function runSoIteration(
-  mode: 'text' | 'structured'
-): Promise<SoIterationResult> {
-  const { runId } = await triggerBenchRun('benchSoWorkflow', [
-    SO_CHUNK_COUNT,
-    SO_INTERVAL_MS,
-    mode,
-  ]);
-  try {
-    const returnValue = await withTimeout(
-      getReturnValue(runId),
-      // The writer streams for the whole generation window before the run can
-      // complete, so extend the guard past the base run timeout by that window.
-      RUN_TIMEOUT_MS + SO_NOMINAL_DURATION_MS,
-      `benchSoWorkflow (${mode}) returnValue (run ${runId})`
-    );
-    const so = (returnValue as { so?: BenchStreamOverhead } | undefined)?.so;
-    if (
-      !so ||
-      typeof so.writtenAt !== 'number' ||
-      typeof so.doneAt !== 'number'
-    ) {
-      throw new Error(
-        `Run ${runId} returned no stream-overhead sample: ${JSON.stringify(returnValue)?.slice(0, 200)}`
-      );
-    }
-    if (so.received !== SO_CHUNK_COUNT) {
-      throw new Error(
-        `Run ${runId} consumed ${so.received} chunks, expected ${SO_CHUNK_COUNT}`
-      );
-    }
-    // Both timestamps are deployment-side; subtract the modelled generation
-    // window and clamp to absorb tiny intra-Vercel skew.
-    return {
-      runId,
-      soMs: Math.max(0, so.doneAt - so.writtenAt - SO_NOMINAL_DURATION_MS),
-    };
-  } catch (error) {
-    (error as Error).message += ` (run ${runId})`;
-    throw error;
-  }
-}
-
 async function runCrttIteration(
   variant: 'llm' | 'sweep'
 ): Promise<CrttIterationResult> {
-  // Same chunk count and pacing as the SO scenarios, so the llm-shaped CRTT
-  // numbers describe the exact same workload SO measures in aggregate.
   const { runId } = await triggerBenchRun('benchCrttWorkflow', [
-    SO_CHUNK_COUNT,
-    SO_INTERVAL_MS,
+    CRTT_CHUNK_COUNT,
+    CRTT_INTERVAL_MS,
     variant,
   ]);
   try {
@@ -524,7 +418,7 @@ async function runCrttIteration(
       getReturnValue(runId),
       // The writer streams for the whole generation window before the run can
       // complete, so extend the guard past the base run timeout by that window.
-      RUN_TIMEOUT_MS + SO_NOMINAL_DURATION_MS,
+      RUN_TIMEOUT_MS + CRTT_NOMINAL_DURATION_MS,
       `benchCrttWorkflow (${variant}) returnValue (run ${runId})`
     );
     const crtt = (returnValue as { crtt?: BenchChunkRttResult } | undefined)
@@ -534,9 +428,9 @@ async function runCrttIteration(
         `Run ${runId} returned no chunk-RTT summaries: ${JSON.stringify(returnValue)?.slice(0, 200)}`
       );
     }
-    if (crtt.received !== SO_CHUNK_COUNT) {
+    if (crtt.received !== CRTT_CHUNK_COUNT) {
       throw new Error(
-        `Run ${runId} consumed ${crtt.received} chunks, expected ${SO_CHUNK_COUNT}`
+        `Run ${runId} consumed ${crtt.received} chunks, expected ${CRTT_CHUNK_COUNT}`
       );
     }
     return { runId, crtt };
@@ -782,18 +676,10 @@ const SCENARIO_STEP = 'step';
 const SCENARIO_TURBO_STREAM = 'stream';
 const SCENARIO_HOOK_STREAM = 'hook + stream';
 const SCENARIO_SEQUENTIAL = `${SEQUENTIAL_STEP_COUNT} steps`;
-const SCENARIO_STREAM_LATENCY = 'stream latency';
-// Two SO scenarios differing only in payload shape. The labels are distinct
-// from the pre-existing 'stream overhead' baseline key, so the payload change
-// doesn't diff against the old fixed-'aaaa' numbers — the SO deltas start blank
-// and re-baseline on the next `main` run.
-const SCENARIO_STREAM_OVERHEAD_TEXT = 'stream overhead (text)';
-const SCENARIO_STREAM_OVERHEAD_STRUCTURED = 'stream overhead (structured)';
 // CRTT scenario labels, doubling as the headline rows' scenario keys; the
 // per-bucket detail rows are keyed `chunk RTT llm (<bucket>)` /
-// `chunk RTT sweep (<bucket>)`. All new baseline keys, so nothing diffs
-// against pre-existing SL/SO baselines (their scenarios and payloads are
-// untouched) and the CRTT deltas stay blank until `main` produces them.
+// `chunk RTT sweep (<bucket>)`. All new baseline keys, so the CRTT deltas
+// stay blank until `main` produces them.
 const SCENARIO_CHUNK_RTT_LLM = 'chunk RTT (llm)';
 const SCENARIO_CHUNK_RTT_SWEEP = 'chunk RTT (size sweep)';
 const SCENARIO_DESCRIPTIONS = [
@@ -817,21 +703,8 @@ const SCENARIO_DESCRIPTIONS = [
     description: `${SEQUENTIAL_STEP_COUNT} trivial sequential steps; STSO is measured between consecutive steps in the given step ranges, and WO is the whole-run overhead outside step bodies`,
   },
   {
-    name: SCENARIO_STREAM_LATENCY,
-    description:
-      'parallel reader/writer steps on a dedicated stream; SL is the in-deployment write->read propagation (readAt - writtenAt)',
-  },
-  {
-    name: SCENARIO_STREAM_OVERHEAD_TEXT,
-    description: `writer streams ${SO_CHUNK_COUNT} variable-length text token deltas paced at ${SO_CHUNK_RATE_PER_SEC}/s for ${SO_DURATION_SECONDS}s (a haiku-size LLM's token throughput) while a parallel reader drains the whole stream; SO is the end-to-end write+consume time beyond the ${SO_DURATION_SECONDS}s generation window (overhead/backpressure)`,
-  },
-  {
-    name: SCENARIO_STREAM_OVERHEAD_STRUCTURED,
-    description: `same workload as ${SCENARIO_STREAM_OVERHEAD_TEXT}, but each delta is an AI-SDK-style structured object ({ type: 'text-delta', id, text }) instead of a raw string, so the SO gap vs the text scenario is the added serialization cost`,
-  },
-  {
     name: SCENARIO_CHUNK_RTT_LLM,
-    description: `writer streams the same paced ${SO_CHUNK_COUNT}-chunk LLM-shaped workload as the SO scenarios, but every delta embeds { seq, writtenAt }; the reader stamps each chunk's arrival and aggregates per-chunk write->read RTT on the deployment, split by chunk index (seq 0 = stream-open write, seq 1-20 = warmup, seq 21+ = steady state) plus a mean-RTT-per-tenth-of-stream progress profile that surfaces drift`,
+    description: `writer streams ${CRTT_CHUNK_COUNT} variable-length LLM-shaped token deltas paced at ${CRTT_CHUNK_RATE_PER_SEC}/s for ${CRTT_DURATION_SECONDS}s (a haiku-size LLM's token throughput), every delta embedding { seq, writtenAt }; a parallel reader stamps each chunk's arrival and aggregates per-chunk write->read RTT on the deployment, split by chunk index (seq 0 = stream-open write, seq 1-20 = warmup, seq 21+ = steady state) plus a mean-RTT-per-tenth-of-stream progress profile that surfaces drift`,
   },
   {
     name: SCENARIO_CHUNK_RTT_SWEEP,
@@ -933,56 +806,6 @@ describe('workflow benchmarks', () => {
         SCENARIO_HOOK_STREAM,
         results.map((r) => r.ttfsMs),
         TTFS_TARGETS
-      );
-    }
-  );
-
-  test('scenario: stream latency', { timeout: 30 * 60_000 }, async () => {
-    const results = await runScenario(
-      SCENARIO_STREAM_LATENCY,
-      SL_ITERATIONS,
-      () => runSlIteration()
-    );
-    recordMetric(
-      'sl',
-      SCENARIO_STREAM_LATENCY,
-      results.map((r) => r.slMs),
-      SL_TARGETS
-    );
-  });
-
-  test(
-    'scenario: stream overhead (text)',
-    { timeout: 30 * 60_000 },
-    async () => {
-      const results = await runScenario(
-        SCENARIO_STREAM_OVERHEAD_TEXT,
-        SO_ITERATIONS,
-        () => runSoIteration('text')
-      );
-      recordMetric(
-        'so',
-        SCENARIO_STREAM_OVERHEAD_TEXT,
-        results.map((r) => r.soMs),
-        SO_TARGETS
-      );
-    }
-  );
-
-  test(
-    'scenario: stream overhead (structured)',
-    { timeout: 30 * 60_000 },
-    async () => {
-      const results = await runScenario(
-        SCENARIO_STREAM_OVERHEAD_STRUCTURED,
-        SO_ITERATIONS,
-        () => runSoIteration('structured')
-      );
-      recordMetric(
-        'so',
-        SCENARIO_STREAM_OVERHEAD_STRUCTURED,
-        results.map((r) => r.soMs),
-        SO_TARGETS
       );
     }
   );
@@ -1119,12 +942,10 @@ describe('workflow benchmarks', () => {
       commit: process.env.GITHUB_SHA || undefined,
       config: {
         streamIterations: STREAM_ITERATIONS,
-        slIterations: SL_ITERATIONS,
-        soIterations: SO_ITERATIONS,
-        soChunkCount: SO_CHUNK_COUNT,
-        soChunkRatePerSec: SO_CHUNK_RATE_PER_SEC,
-        soDurationSeconds: SO_DURATION_SECONDS,
         crttIterations: CRTT_ITERATIONS,
+        crttChunkCount: CRTT_CHUNK_COUNT,
+        crttChunkRatePerSec: CRTT_CHUNK_RATE_PER_SEC,
+        crttDurationSeconds: CRTT_DURATION_SECONDS,
         sequentialIterations: SEQUENTIAL_ITERATIONS,
         sequentialStepCount: SEQUENTIAL_STEP_COUNT,
         warmupIterations: WARMUP_ITERATIONS,

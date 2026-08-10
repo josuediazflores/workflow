@@ -617,7 +617,14 @@ async function crttWriterStep(
  * (the SL scenario's payload-embedded-timestamp trick applied to all chunks),
  * and the reader computes each chunk's write->read RTT on arrival (the "round
  * trip" being deployment -> stream backend -> co-located reader, not an echo
- * back to the writer). The reader aggregates the samples on the deployment
+ * back to the writer).
+ *
+ * Naming: CRTT (chunk ROUND-trip time) is reserved for this same-clock-domain
+ * setup, where "round" is literally true — the chunk returns to the
+ * deployment whose clock stamped it. The future production write->read
+ * metric crosses clocks (producer deployment -> arbitrary consumer) and is a
+ * one-way trip: that one is CTT (chunk trip time), a separate metric with
+ * its own clock-skew caveats. Keep the names distinct. The reader aggregates the samples on the deployment
  * (see 97_bench_rtt.ts): chunk-index buckets, a per-tenth-of-stream progress
  * profile, a per-log-size-bin size profile, and fixed log-bin histograms so
  * distributions merge and diff exactly across runs. The `'llm'` variant
