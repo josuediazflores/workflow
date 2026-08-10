@@ -86,35 +86,55 @@ export function isTerminalStepEventType(
 }
 
 /**
- * Event types that put the entity named by their `correlationId` into its
- * final state: a step that completed or failed, a wait that fired, a hook that
- * was disposed. Once one of these is in the log, the workflow body's consumer
- * for that correlation id has run to completion and deregistered, so no
- * further event carrying the same correlation id has a consumer left to claim
- * it.
+ * Groups event types into the classes a replay tracks per entity: the entity
+ * named by the event's `correlationId`, or the run itself for run events,
+ * which carry none.
  *
- * Note the omissions. `step_retrying` is not terminal (a retry writes another
- * `step_started`), and `hook_received` is not terminal (a hook delivers many
- * payloads until it is disposed).
+ * Types that share a class are the mutually exclusive outcomes of one
+ * decision, so the log records the class once and the first event of it is the
+ * one that counts: a step either completes or fails, a run either completes,
+ * fails, or is cancelled.
+ *
+ * Classes are independent of each other. A step whose result is in the log has
+ * still recorded exactly one `step_created`, and can still record another
+ * `step_started` if an attempt is running somewhere. What a class bounds is
+ * which events can be *ignored*: a replay may pass over an event whose class
+ * it already recorded for that entity and which no consumer wants (see
+ * `EventsConsumer`), and only then.
+ *
+ * Note the omissions. `hook_received` and `hook_conflict` are deliveries whose
+ * consumer subscribes lazily, `attr_set` is written on every attribute write,
+ * and `run_created` precedes every replay.
  */
-const EntityTerminalEventTypeSchema = EventTypeSchema.extract([
-  'step_completed',
-  'step_failed',
-  'wait_completed',
-  'hook_disposed',
-] as const);
-export type EntityTerminalEventType = z.infer<
-  typeof EntityTerminalEventTypeSchema
->;
-export const ENTITY_TERMINAL_EVENT_TYPES =
-  EntityTerminalEventTypeSchema.options;
+const ENTITY_EVENT_CLASS_BY_TYPE = {
+  step_created: 'step_created',
+  step_started: 'step_started',
+  step_retrying: 'step_retrying',
+  step_completed: 'step_terminal',
+  step_failed: 'step_terminal',
+  wait_created: 'wait_created',
+  wait_completed: 'wait_completed',
+  hook_created: 'hook_created',
+  hook_disposed: 'hook_disposed',
+  run_started: 'run_started',
+  run_completed: 'run_terminal',
+  run_failed: 'run_terminal',
+  run_cancelled: 'run_terminal',
+} as const satisfies Partial<Record<EventType, string>>;
 
-export function isEntityTerminalEventType(
+export type EntityEventClass =
+  (typeof ENTITY_EVENT_CLASS_BY_TYPE)[keyof typeof ENTITY_EVENT_CLASS_BY_TYPE];
+
+/**
+ * The per-entity class `eventType` belongs to, or `undefined` when it belongs
+ * to none. See {@link ENTITY_EVENT_CLASS_BY_TYPE}.
+ */
+export function entityEventClass(
   eventType: string
-): eventType is EntityTerminalEventType {
-  return ENTITY_TERMINAL_EVENT_TYPES.includes(
-    eventType as EntityTerminalEventType
-  );
+): EntityEventClass | undefined {
+  return (
+    ENTITY_EVENT_CLASS_BY_TYPE as Record<string, EntityEventClass | undefined>
+  )[eventType];
 }
 
 const HookLifecycleEventTypeSchema = EventTypeSchema.extract([

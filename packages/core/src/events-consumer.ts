@@ -1,8 +1,4 @@
-import {
-  type Event,
-  envNumber,
-  isEntityTerminalEventType,
-} from '@workflow/world';
+import { type Event, entityEventClass, envNumber } from '@workflow/world';
 import { eventsLogger } from './logger.js';
 
 /**
@@ -63,11 +59,11 @@ export interface EventsConsumerOptions {
    */
   onUnconsumedEvent: (event: Event) => void;
   /**
-   * Callback invoked when an event is skipped because its correlation id had
-   * already reached a terminal state earlier in the log. Diagnostics only —
+   * Callback invoked when an event is skipped because it repeats an event
+   * class the log already records for the same entity. Diagnostics only:
    * skipping is a normal outcome, not an error.
    */
-  onPostTerminalEvent?: (event: Event) => void;
+  onDuplicateEvent?: (event: Event) => void;
   /**
    * Returns the current promise queue. The unconsumed event check is chained
    * onto this queue so it only fires after all pending async work (e.g.,
@@ -83,16 +79,16 @@ export class EventsConsumer {
   readonly callbacks: EventConsumerCallback[] = [];
   private onConsumedEvent?: (event: Event) => void;
   private onUnconsumedEvent: (event: Event) => void;
-  private onPostTerminalEvent?: (event: Event) => void;
+  private onDuplicateEvent?: (event: Event) => void;
   private getPromiseQueue: () => Promise<void>;
   private pendingUnconsumedCheck: Promise<void> | null = null;
   private pendingUnconsumedTimeout: ReturnType<typeof setTimeout> | null = null;
   private unconsumedCheckVersion = 0;
   /**
-   * Correlation ids whose terminal event the cursor has already passed. See
-   * {@link EventsConsumer.isPostTerminal}.
+   * `<class>:<correlationId>` for every event class the cursor has already
+   * passed. See {@link EventsConsumer.isDuplicateEvent}.
    */
-  private readonly terminalCorrelationIds = new Set<string>();
+  private readonly seenEventClasses = new Set<string>();
 
   constructor(events: Event[], options: EventsConsumerOptions) {
     // Own copy: the runtime mutates its event array in place, and a retained
@@ -102,7 +98,7 @@ export class EventsConsumer {
     this.eventIndex = 0;
     this.onConsumedEvent = options.onConsumedEvent;
     this.onUnconsumedEvent = options.onUnconsumedEvent;
-    this.onPostTerminalEvent = options.onPostTerminalEvent;
+    this.onDuplicateEvent = options.onDuplicateEvent;
     this.getPromiseQueue = options.getPromiseQueue;
   }
 
@@ -168,10 +164,10 @@ export class EventsConsumer {
       const currentEvent = this.events[this.eventIndex] ?? null;
       if (!this.consumeOne(currentEvent)) {
         // No callback wanted the event. Before treating that as divergence,
-        // check whether it is a late write for an entity the log already
-        // finished — those are ignorable and the cursor moves on.
-        if (currentEvent !== null && this.isPostTerminal(currentEvent)) {
-          this.skipPostTerminal(currentEvent);
+        // check whether it repeats a class the log already records for the
+        // same entity. Those are ignorable and the cursor moves on.
+        if (currentEvent !== null && this.isDuplicateEvent(currentEvent)) {
+          this.skipDuplicateEvent(currentEvent);
           continue;
         }
         // No callback consumed the current event; handle the terminal case.
@@ -207,7 +203,7 @@ export class EventsConsumer {
         continue;
       }
       if (currentEvent !== null) {
-        this.recordTerminalCorrelationId(currentEvent);
+        this.recordEventClass(currentEvent);
         this.notifyConsumedEvent(currentEvent);
       }
       // consumer handled this event, so increase the event index
@@ -225,55 +221,69 @@ export class EventsConsumer {
   }
 
   /**
-   * Remembers that `event` put its correlation id into a final state, so any
-   * later event carrying the same id can be skipped rather than treated as
-   * divergence.
+   * The key `event`'s class is tracked under, or `undefined` for the event
+   * types that belong to no class (`hook_received`, `hook_conflict`,
+   * `attr_set`, `run_created`) and are therefore never skipped.
+   *
+   * Run events carry no correlation id. They are classes of the run itself, so
+   * they all key off the same bucket.
    */
-  private recordTerminalCorrelationId(event: Event) {
-    if (
-      event.correlationId !== undefined &&
-      isEntityTerminalEventType(event.eventType)
-    ) {
-      this.terminalCorrelationIds.add(event.correlationId);
+  private eventClassKey(event: Event): string | undefined {
+    const eventClass = entityEventClass(event.eventType);
+    return eventClass === undefined
+      ? undefined
+      : `${eventClass}:${event.correlationId}`;
+  }
+
+  /** Remembers the class `event` belongs to, if it belongs to one. */
+  private recordEventClass(event: Event) {
+    const key = this.eventClassKey(event);
+    if (key !== undefined) {
+      this.seenEventClasses.add(key);
     }
   }
 
   /**
-   * Whether `event` names an entity the cursor already saw reach its terminal
-   * state.
+   * Whether `event` repeats a class the cursor already passed for the same
+   * entity, with no consumer left that wants this copy: a second
+   * `step_created` for one step, a second terminal outcome, a second
+   * `step_started` after the step's result is already in the log.
    *
    * Such an event is committed but inert. Concurrent replays write into one
    * log without a currency guard, so a replay working from a prefix that
-   * predates the terminal event can still commit a `step_created` /
-   * `step_started` / `wait_created` for that same entity — or a second
-   * terminal write, against a World that does not enforce one per entity. None
-   * of those can change what the workflow observed: the entity's outcome was
-   * already decided by the terminal event and every later replay reads that
-   * same outcome at the same log position, so ignoring the straggler is
-   * deterministic across replays.
+   * predates another replay's write can commit its own copy of work the log
+   * already records. That copy cannot change what the workflow observed: the
+   * outcome was decided by the first event of the class and every later replay
+   * reads that same event at the same log position, so ignoring the straggler
+   * is deterministic across replays.
    *
-   * The check runs only after every registered callback declined the event,
-   * so it can never take an event a consumer wanted. It cannot starve a
-   * consumer that has yet to register either: the entity's own consumer
-   * already ran to completion and deregistered (that is what made the
-   * correlation id terminal), and correlation ids are minted monotonically,
-   * so no future consumer claims this id.
+   * Classes are tracked separately, so passing one does not suppress another.
+   * A step whose result is in the log still reaches its `step_created` and
+   * `step_started` consumers if it has yet to see those classes.
+   *
+   * The check runs only after every registered callback declined the event, so
+   * it can never take an event a consumer wanted. A retry's `step_started` is
+   * claimed by the step's live consumer and counts as an attempt exactly as
+   * before; only the copies nobody claims are skipped. It cannot starve a
+   * consumer that has yet to register either: a consumer claims its entity's
+   * events in log order from the moment the body creates it, so a class the
+   * cursor already passed was passed with that consumer registered, and
+   * correlation ids are minted monotonically, so no future consumer claims
+   * this id.
    */
-  private isPostTerminal(event: Event): boolean {
-    return (
-      event.correlationId !== undefined &&
-      this.terminalCorrelationIds.has(event.correlationId)
-    );
+  private isDuplicateEvent(event: Event): boolean {
+    const key = this.eventClassKey(event);
+    return key !== undefined && this.seenEventClasses.has(key);
   }
 
-  private skipPostTerminal(event: Event) {
+  private skipDuplicateEvent(event: Event) {
     this.eventIndex++;
     // Deliberately not routed through `notifyConsumedEvent`: the deterministic
     // clock advances only on events the workflow actually observed. A skipped
     // event is invisible to the workflow body, and a log that happens to
     // contain one must produce the same timestamps as a log that does not.
     eventsLogger.debug(
-      'Skipping event for an already-terminal correlation id',
+      'Skipping event that repeats a class already in the log',
       {
         eventId: event.eventId,
         eventType: event.eventType,
@@ -281,9 +291,9 @@ export class EventsConsumer {
       }
     );
     try {
-      this.onPostTerminalEvent?.(event);
+      this.onDuplicateEvent?.(event);
     } catch (error) {
-      eventsLogger.error('onPostTerminalEvent callback threw an error', {
+      eventsLogger.error('onDuplicateEvent callback threw an error', {
         error,
       });
     }

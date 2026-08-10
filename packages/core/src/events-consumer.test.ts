@@ -40,7 +40,7 @@ function waitPastDeferredCheck(): Promise<void> {
 }
 
 // Unlike createMockEvent above, this builds the real `Event` shape, which the
-// post-terminal skip needs: it reads `eventType` and `correlationId`.
+// duplicate-class skip needs: it reads `eventType` and `correlationId`.
 let realEventCounter = 0;
 function createRealEvent(
   eventType: string,
@@ -526,8 +526,8 @@ describe('EventsConsumer', () => {
     });
   });
 
-  describe('post-terminal events', () => {
-    it('skips a step_started written after step_completed for the same correlation id', async () => {
+  describe('duplicate event classes', () => {
+    it('skips a step_started that repeats a class already in the log', async () => {
       const corr = 'step_A';
       const events = [
         createRealEvent('step_created', corr),
@@ -538,10 +538,10 @@ describe('EventsConsumer', () => {
         createRealEvent('step_started', corr),
       ];
       const onUnconsumedEvent = vi.fn();
-      const onPostTerminalEvent = vi.fn();
+      const onDuplicateEvent = vi.fn();
       const consumer = new EventsConsumer(events, {
         onUnconsumedEvent,
-        onPostTerminalEvent,
+        onDuplicateEvent,
         getPromiseQueue: () => Promise.resolve(),
       });
 
@@ -550,8 +550,33 @@ describe('EventsConsumer', () => {
 
       expect(consumer.eventIndex).toBe(events.length);
       expect(onUnconsumedEvent).not.toHaveBeenCalled();
-      expect(onPostTerminalEvent).toHaveBeenCalledTimes(1);
-      expect(onPostTerminalEvent).toHaveBeenCalledWith(events[3]);
+      expect(onDuplicateEvent).toHaveBeenCalledTimes(1);
+      expect(onDuplicateEvent).toHaveBeenCalledWith(events[3]);
+    });
+
+    it('skips a step_created that repeats a class already in the log', async () => {
+      // Classes are tracked independently, so a completed step still has a
+      // recorded step_created and a second one is ignorable.
+      const corr = 'step_A';
+      const events = [
+        createRealEvent('step_created', corr),
+        createRealEvent('step_completed', corr),
+        createRealEvent('step_created', corr),
+      ];
+      const onUnconsumedEvent = vi.fn();
+      const onDuplicateEvent = vi.fn();
+      const consumer = new EventsConsumer(events, {
+        onUnconsumedEvent,
+        onDuplicateEvent,
+        getPromiseQueue: () => Promise.resolve(),
+      });
+
+      consumer.subscribe(entityConsumer(corr, 'step_completed'));
+      await waitPastDeferredCheck();
+
+      expect(consumer.eventIndex).toBe(events.length);
+      expect(onUnconsumedEvent).not.toHaveBeenCalled();
+      expect(onDuplicateEvent).toHaveBeenCalledWith(events[2]);
     });
 
     it('skips a duplicate wait_completed', async () => {
@@ -562,10 +587,10 @@ describe('EventsConsumer', () => {
         createRealEvent('wait_completed', corr),
       ];
       const onUnconsumedEvent = vi.fn();
-      const onPostTerminalEvent = vi.fn();
+      const onDuplicateEvent = vi.fn();
       const consumer = new EventsConsumer(events, {
         onUnconsumedEvent,
-        onPostTerminalEvent,
+        onDuplicateEvent,
         getPromiseQueue: () => Promise.resolve(),
       });
 
@@ -574,10 +599,44 @@ describe('EventsConsumer', () => {
 
       expect(consumer.eventIndex).toBe(events.length);
       expect(onUnconsumedEvent).not.toHaveBeenCalled();
-      expect(onPostTerminalEvent).toHaveBeenCalledWith(events[2]);
+      expect(onDuplicateEvent).toHaveBeenCalledWith(events[2]);
     });
 
-    it('still reports an unconsumed event whose correlation id never went terminal', async () => {
+    it('skips a duplicate run_started, which carries no correlation id', async () => {
+      const events = [
+        createRealEvent('run_started', undefined),
+        createRealEvent('run_started', undefined),
+      ];
+      const onUnconsumedEvent = vi.fn();
+      const onDuplicateEvent = vi.fn();
+      const onConsumedEvent = vi.fn();
+      const consumer = new EventsConsumer(events, {
+        onUnconsumedEvent,
+        onDuplicateEvent,
+        onConsumedEvent,
+        getPromiseQueue: () => Promise.resolve(),
+      });
+
+      // The runtime's run-lifecycle callback takes the first run_started and
+      // declines the rest rather than deregistering, since it still handles
+      // other run events.
+      let consumedRunStarted = false;
+      consumer.subscribe((event: Event | null) => {
+        if (event?.eventType !== 'run_started' || consumedRunStarted) {
+          return EventConsumerResult.NotConsumed;
+        }
+        consumedRunStarted = true;
+        return EventConsumerResult.Consumed;
+      });
+      await waitPastDeferredCheck();
+
+      expect(consumer.eventIndex).toBe(events.length);
+      expect(onUnconsumedEvent).not.toHaveBeenCalled();
+      expect(onDuplicateEvent).toHaveBeenCalledWith(events[1]);
+      expect(onConsumedEvent).toHaveBeenCalledTimes(1);
+    });
+
+    it('still reports an unconsumed event for a correlation id the log has nothing for', async () => {
       const events = [
         createRealEvent('step_created', 'step_A'),
         createRealEvent('step_started', 'step_A'),
@@ -586,10 +645,10 @@ describe('EventsConsumer', () => {
         createRealEvent('wait_created', 'wait_B'),
       ];
       const onUnconsumedEvent = vi.fn();
-      const onPostTerminalEvent = vi.fn();
+      const onDuplicateEvent = vi.fn();
       const consumer = new EventsConsumer(events, {
         onUnconsumedEvent,
-        onPostTerminalEvent,
+        onDuplicateEvent,
         getPromiseQueue: () => Promise.resolve(),
       });
 
@@ -597,47 +656,78 @@ describe('EventsConsumer', () => {
       await waitPastDeferredCheck();
 
       expect(consumer.eventIndex).toBe(3);
-      expect(onPostTerminalEvent).not.toHaveBeenCalled();
+      expect(onDuplicateEvent).not.toHaveBeenCalled();
       expect(onUnconsumedEvent).toHaveBeenCalledWith(events[3]);
     });
 
-    it('does not treat step_retrying or hook_received as terminal', async () => {
-      // Neither event ends its entity: a retry writes another step_started, and
-      // a hook keeps receiving until it is disposed. An unclaimed event after
-      // either one is still divergence.
+    it('does not let one class suppress another for the same entity', async () => {
+      // The step's outcome is in the log but its first attempt never wrote a
+      // step_started, so this one is not a repeat of anything and divergence
+      // is the right answer.
+      const corr = 'step_A';
       const events = [
-        createRealEvent('step_created', 'step_A'),
-        createRealEvent('step_retrying', 'step_A'),
-        createRealEvent('step_started', 'step_A'),
+        createRealEvent('step_created', corr),
+        createRealEvent('step_completed', corr),
+        createRealEvent('step_started', corr),
       ];
       const onUnconsumedEvent = vi.fn();
+      const onDuplicateEvent = vi.fn();
       const consumer = new EventsConsumer(events, {
         onUnconsumedEvent,
+        onDuplicateEvent,
         getPromiseQueue: () => Promise.resolve(),
       });
 
-      // Consumes the first two events, then deregisters, leaving the trailing
-      // step_started unclaimed.
-      consumer.subscribe(entityConsumer('step_A', 'step_retrying'));
+      consumer.subscribe(entityConsumer(corr, 'step_completed'));
       await waitPastDeferredCheck();
 
+      expect(consumer.eventIndex).toBe(2);
+      expect(onDuplicateEvent).not.toHaveBeenCalled();
+      expect(onUnconsumedEvent).toHaveBeenCalledWith(events[2]);
+    });
+
+    it('does not track hook deliveries, whose consumers subscribe lazily', async () => {
+      // A hook keeps receiving until its consumer stops asking, so a
+      // hook_received nobody claims is still divergence however many the log
+      // already holds.
+      const corr = 'hook_A';
+      const events = [
+        createRealEvent('hook_created', corr),
+        createRealEvent('hook_received', corr),
+        createRealEvent('hook_received', corr),
+      ];
+      const onUnconsumedEvent = vi.fn();
+      const onDuplicateEvent = vi.fn();
+      const consumer = new EventsConsumer(events, {
+        onUnconsumedEvent,
+        onDuplicateEvent,
+        getPromiseQueue: () => Promise.resolve(),
+      });
+
+      // Takes the create and the first delivery, then deregisters.
+      consumer.subscribe(entityConsumer(corr, 'hook_received'));
+      await waitPastDeferredCheck();
+
+      expect(onDuplicateEvent).not.toHaveBeenCalled();
       expect(onUnconsumedEvent).toHaveBeenCalledWith(events[2]);
     });
 
     it('never takes an event a registered callback still wants', async () => {
-      // A callback that claims post-terminal events wins: the skip is a
-      // last resort, consulted only after every callback declined.
-      const corr = 'hook_A';
+      // The skip is a last resort, consulted only after every callback
+      // declined, which is what lets a retry's step_started reach the live
+      // consumer and count as an attempt.
+      const corr = 'step_A';
       const events = [
-        createRealEvent('hook_created', corr),
-        createRealEvent('hook_disposed', corr),
-        createRealEvent('hook_received', corr),
+        createRealEvent('step_created', corr),
+        createRealEvent('step_started', corr),
+        createRealEvent('step_retrying', corr),
+        createRealEvent('step_started', corr),
       ];
       const onUnconsumedEvent = vi.fn();
-      const onPostTerminalEvent = vi.fn();
+      const onDuplicateEvent = vi.fn();
       const consumer = new EventsConsumer(events, {
         onUnconsumedEvent,
-        onPostTerminalEvent,
+        onDuplicateEvent,
         getPromiseQueue: () => Promise.resolve(),
       });
 
@@ -650,8 +740,8 @@ describe('EventsConsumer', () => {
       await waitPastDeferredCheck();
 
       expect(consumer.eventIndex).toBe(events.length);
-      expect(callback).toHaveBeenCalledWith(events[2]);
-      expect(onPostTerminalEvent).not.toHaveBeenCalled();
+      expect(callback).toHaveBeenCalledWith(events[3]);
+      expect(onDuplicateEvent).not.toHaveBeenCalled();
       expect(onUnconsumedEvent).not.toHaveBeenCalled();
     });
 

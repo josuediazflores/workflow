@@ -12,15 +12,14 @@ import { createSleep } from './workflow/sleep.js';
 
 /**
  * Concurrent replays of one run share a single event log and write to it
- * without a currency guard, so a replay working from a prefix that predates
- * another replay's terminal write can still commit a `step_created` /
- * `step_started` / `wait_created` for an entity whose outcome is already in the
- * log. Those writes are committed but inert: every replay reads the same
- * terminal event at the same position, so the straggler cannot change what the
- * workflow observes.
+ * without a currency guard, so a replay working from a stale prefix can commit
+ * a second `step_created` / `step_started` / `wait_created` for an entity the
+ * log already records one of. Those writes are committed but inert: every
+ * replay reads the first event of that class at the same position, so the
+ * straggler cannot change what the workflow observes.
  *
  * Before this behavior existed the straggler had no consumer left to claim it
- * (the entity's consumer deregistered when it took the terminal event), which
+ * (the entity's consumer deregistered when it took the step's result), which
  * surfaced as `ReplayDivergenceError` and, after retries, a terminal
  * `CORRUPTED_EVENT_LOG` on a run whose log was fine.
  *
@@ -57,10 +56,10 @@ function pendingStepNames(ctx: ReturnType<typeof setupWorkflowContext>) {
     .map((i) => (i.type === 'step' ? i.stepName : undefined));
 }
 
-describe('events written after their correlation id went terminal', () => {
+describe('events repeating a class already in the log', () => {
   it('ignores a step_started that lands after the step completed', async () => {
     const result = await dehydrate('a-result');
-    const onPostTerminalEvent = vi.fn();
+    const onDuplicateEvent = vi.fn();
     const events = [
       event(0, 'step_created', `step_${CORR_IDS[0]}`, { stepName: 'stepA' }),
       event(1, 'step_started', `step_${CORR_IDS[0]}`, { stepName: 'stepA' }),
@@ -72,7 +71,7 @@ describe('events written after their correlation id went terminal', () => {
       event(3, 'step_started', `step_${CORR_IDS[0]}`, { stepName: 'stepA' }),
       event(4, 'step_created', `step_${CORR_IDS[1]}`, { stepName: 'stepB' }),
     ];
-    const ctx = setupWorkflowContext(events, { onPostTerminalEvent });
+    const ctx = setupWorkflowContext(events, { onDuplicateEvent });
     const useStep = createUseStep(ctx);
 
     const observed: unknown[] = [];
@@ -88,12 +87,12 @@ describe('events written after their correlation id went terminal', () => {
     expect(WorkflowSuspension.is(error)).toBe(true);
     expect(observed).toEqual(['a-result']);
     expect(pendingStepNames(ctx)).toEqual(['stepB']);
-    expect(onPostTerminalEvent).toHaveBeenCalledTimes(1);
-    expect(onPostTerminalEvent).toHaveBeenCalledWith(events[3]);
+    expect(onDuplicateEvent).toHaveBeenCalledTimes(1);
+    expect(onDuplicateEvent).toHaveBeenCalledWith(events[3]);
   });
 
   it('ignores a wait_created that lands after the wait completed', async () => {
-    const onPostTerminalEvent = vi.fn();
+    const onDuplicateEvent = vi.fn();
     const events = [
       event(0, 'wait_created', `wait_${CORR_IDS[0]}`, { resumeAt: RESUME_AT }),
       event(1, 'wait_completed', `wait_${CORR_IDS[0]}`, {
@@ -105,7 +104,7 @@ describe('events written after their correlation id went terminal', () => {
         stepName: 'afterSleep',
       }),
     ];
-    const ctx = setupWorkflowContext(events, { onPostTerminalEvent });
+    const ctx = setupWorkflowContext(events, { onDuplicateEvent });
     const sleep = createSleep(ctx);
     const useStep = createUseStep(ctx);
 
@@ -117,13 +116,13 @@ describe('events written after their correlation id went terminal', () => {
 
     expect(WorkflowSuspension.is(error)).toBe(true);
     expect(pendingStepNames(ctx)).toEqual(['afterSleep']);
-    expect(onPostTerminalEvent).toHaveBeenCalledTimes(1);
-    expect(onPostTerminalEvent).toHaveBeenCalledWith(events[2]);
+    expect(onDuplicateEvent).toHaveBeenCalledTimes(1);
+    expect(onDuplicateEvent).toHaveBeenCalledWith(events[2]);
   });
 
-  it('still reports divergence for an event whose entity never went terminal', async () => {
+  it('still reports divergence for an event repeating nothing in the log', async () => {
     const result = await dehydrate('a-result');
-    const onPostTerminalEvent = vi.fn();
+    const onDuplicateEvent = vi.fn();
     const events = [
       event(0, 'step_created', `step_${CORR_IDS[0]}`, { stepName: 'stepA' }),
       event(1, 'step_started', `step_${CORR_IDS[0]}`, { stepName: 'stepA' }),
@@ -137,7 +136,7 @@ describe('events written after their correlation id went terminal', () => {
         resumeAt: RESUME_AT,
       }),
     ];
-    const ctx = setupWorkflowContext(events, { onPostTerminalEvent });
+    const ctx = setupWorkflowContext(events, { onDuplicateEvent });
     const sleep = createSleep(ctx);
     const useStep = createUseStep(ctx);
 
@@ -149,6 +148,6 @@ describe('events written after their correlation id went terminal', () => {
 
     expect(WorkflowSuspension.is(error)).toBe(false);
     expect(String(error)).toContain('Unconsumed event in event log');
-    expect(onPostTerminalEvent).not.toHaveBeenCalled();
+    expect(onDuplicateEvent).not.toHaveBeenCalled();
   });
 });

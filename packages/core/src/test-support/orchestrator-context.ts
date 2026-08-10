@@ -17,7 +17,7 @@ import { createContext } from '../vm/index.js';
  */
 export function setupWorkflowContext(
   events: Event[],
-  options: { onPostTerminalEvent?: (event: Event) => void } = {}
+  options: { onDuplicateEvent?: (event: Event) => void } = {}
 ): WorkflowOrchestratorContext {
   const context = createContext({
     seed: 'test',
@@ -45,7 +45,7 @@ export function setupWorkflowContext(
           )
         );
       },
-      onPostTerminalEvent: options.onPostTerminalEvent,
+      onDuplicateEvent: options.onDuplicateEvent,
       getPromiseQueue: () => promiseQueueHolder.current,
     }),
     invocationsQueue: new Map(),

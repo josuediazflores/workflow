@@ -3,4 +3,4 @@
 '@workflow/world': patch
 ---
 
-Ignore events written for a correlation id that already reached its terminal state instead of failing the run with a corrupted event log
+Ignore duplicate events that a concurrent replay wrote for an entity the event log already records, instead of failing the run with a corrupted event log
