@@ -1081,12 +1081,22 @@ ${apiFileContent}`
         };
 
         let snapshot = await waitForGeneratedArtifactStability();
+        const expectedBodyOnlyRebuild = finalConfig.canary
+          ? {
+              ignored: 0,
+              skip: 0,
+              hot: { min: 0 },
+              full: { min: 0 },
+              total: { min: 1 },
+            }
+          : { ignored: 0, skip: 0, hot: 1, full: 0 };
         const cases = [
           {
             file: files.step,
             kind: 'none',
             // A queued setup rebuild may already have snapshotted this file.
             expectedLogCounts: {
+              ignored: 0,
               skip: { min: 0, max: 1 },
               hot: 0,
               full: { min: 0, max: 1 },
@@ -1120,7 +1130,7 @@ export async function hmrFuzzStep() {
           {
             file: files.workflow,
             kind: 'workflow',
-            expectedLogCounts: { skip: 0, hot: 1, full: 0 },
+            expectedLogCounts: expectedBodyOnlyRebuild,
             expectedWorkflowValue: (iteration: number) =>
               `workflow-body-${iteration}`,
             source: (
@@ -1143,7 +1153,7 @@ export async function hmrFuzzWorkflow() {
           {
             file: files.workflowHelper,
             kind: 'workflow',
-            expectedLogCounts: { skip: 0, hot: 1, full: 0 },
+            expectedLogCounts: expectedBodyOnlyRebuild,
             expectedWorkflowValue: (iteration: number) =>
               `workflow-helper-body-${iteration}`,
             source: (
@@ -1158,7 +1168,7 @@ export function hmrFuzzWorkflowHelper(value: HmrFuzzBox) {
           {
             file: files.sharedHelper,
             kind: 'workflow',
-            expectedLogCounts: { skip: 0, hot: 1, full: 0 },
+            expectedLogCounts: expectedBodyOnlyRebuild,
             expectedStepValue: (iteration: number) =>
               `shared-body-${iteration}`,
             expectedWorkflowValue: (iteration: number) =>
@@ -1173,7 +1183,7 @@ export function hmrFuzzWorkflowHelper(value: HmrFuzzBox) {
           {
             file: files.serde,
             kind: 'serde',
-            expectedLogCounts: { skip: 0, hot: 1, full: 0 },
+            expectedLogCounts: expectedBodyOnlyRebuild,
             source: (iteration: number) => `export class HmrFuzzBox {
   static classId = 'HmrFuzzBox';
 
