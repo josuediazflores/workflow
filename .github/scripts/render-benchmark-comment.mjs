@@ -524,12 +524,15 @@ function sparkline(counts) {
 }
 
 /**
- * Renders every CRTT row (headline + `detail` buckets) as ONE line each:
- * a sparkline of the fixed log-bin RTT histogram plus avg/p50/p90/p99, with
- * plain vs-main percentages when a baseline exists. This is the whole CRTT
- * drill-down — the buckets differ by numbers, not by shape, so a matrix is
- * far denser than one chart per bucket, and the sparklines still show each
- * shape (e.g. a delivery-cadence hump).
+ * Renders the CRTT drill-down: ONE line per variant — a sparkline of the
+ * fixed log-bin RTT histogram plus avg/p50/p90/p99 (plain vs-main
+ * percentages when a baseline exists) — followed by the mean-RTT profile
+ * lines. Per-index detail rows are deliberately NOT rendered: three runs
+ * showed them flat and their run-to-run flips are bucket-hopping iteration
+ * noise that invites misreads. They stay in the results JSON (with baseline
+ * annotations), so when a headline delta fires the artifact still localizes
+ * it; the progress line guards position-dependence here with finer
+ * resolution than the buckets did.
  *
  * The avg deltas are exact (count-weighted merges on both sides); p50-p99
  * are cross-iteration percentile-of-percentiles, like the main table.
@@ -538,7 +541,8 @@ function sparkline(counts) {
  */
 function renderCrttMatrixSection(result) {
   const rows = (result.metrics ?? []).filter(
-    (row) => row.metric === 'crtt' && Array.isArray(row.hist?.counts)
+    (row) =>
+      row.metric === 'crtt' && !row.detail && Array.isArray(row.hist?.counts)
   );
   if (rows.length === 0) return '';
   const anyBaseline = rows.some((row) => typeof row.baselineAvg === 'number');
@@ -553,7 +557,7 @@ function renderCrttMatrixSection(result) {
     return ` (${p > 0 ? '+' : ''}${Math.round(p)}%)`;
   };
   const cells = (row) => [
-    [row.group ?? '', row.bucket ?? row.scenario].join(' ').trim(),
+    row.group ?? row.scenario,
     sparkline(row.hist.counts),
     `${round1(row.avg)}${pct(row.avg, row.baselineAvg)}`,
     `${formatMs(row.p50)}${pct(row.p50, row.baselineP50)}`,
@@ -561,7 +565,7 @@ function renderCrttMatrixSection(result) {
     `${formatMs(row.p99)}${pct(row.p99, row.baselineP99)}`,
     String(row.samples),
   ];
-  const header = ['bucket', 'RTT 1ms→5s+', 'avg', 'p50', 'p90', 'p99', 'n'];
+  const header = ['variant', 'RTT 1ms→5s+', 'avg', 'p50', 'p90', 'p99', 'n'];
   const table = [header, ...rows.map(cells)];
   const widths = header.map((_, col) =>
     Math.max(...table.map((line) => line[col].length))
@@ -576,11 +580,7 @@ function renderCrttMatrixSection(result) {
       .trimEnd();
 
   const lines = ['```', renderLine(header)];
-  let previousGroup = rows[0]?.group;
   for (const row of rows) {
-    // Blank line between variants (llm vs sweep) so the groups read apart.
-    if (row.group !== previousGroup) lines.push('');
-    previousGroup = row.group;
     lines.push(renderLine(cells(row)));
   }
   lines.push('```');
@@ -636,7 +636,7 @@ function renderCrttMatrixSection(result) {
   return [
     '',
     '<details>',
-    `<summary>📈 CRTT drill-down${anyBaseline ? ' vs main' : ''} (per-bucket RTT distributions)</summary>`,
+    `<summary>📈 CRTT drill-down${anyBaseline ? ' vs main' : ''} (RTT distributions & profiles)</summary>`,
     '',
     ...(anyBaseline
       ? []
@@ -822,7 +822,7 @@ function renderFooter(entries) {
       : []),
     ...(hasCrttDistribution
       ? [
-          "<sub>The collapsed **CRTT drill-down** shows one line per chunk bucket: a sparkline of that bucket's RTT distribution over fixed log-scale bins (1-2-5 series, <1ms on the left to ≥5s on the right, normalized per line, `·` = empty bin) plus avg/p50/p90/p99, and mean-RTT profile lines: per tenth of the stream (a rising staircase = chunks slow down as the stream grows) and per log size bin (flat = chunk size doesn't matter). RTTs are aggregated inside the reader step on the deployment; histograms, avgs, and profiles merge exactly across iterations and runs, while p50-p99 are percentile-of-percentiles across iterations.</sub>",
+          "<sub>The collapsed **CRTT drill-down** shows one line per variant — a sparkline of its RTT distribution over fixed log-scale bins (1-2-5 series, <1ms on the left to ≥5s on the right, normalized per line, `·` = empty bin) plus avg/p50/p90/p99 — and mean-RTT profile lines: per tenth of the stream (a rising staircase = chunks slow down as the stream grows) and per log size bin (flat = chunk size doesn't matter). RTTs are aggregated inside the reader step on the deployment; histograms, avgs, and profiles merge exactly across iterations and runs, while p50-p99 are percentile-of-percentiles across iterations. Per-index-bucket rows (seq 0 / warmup / steady state) are recorded in the results artifacts for investigations but not rendered.</sub>",
           '',
         ]
       : []),

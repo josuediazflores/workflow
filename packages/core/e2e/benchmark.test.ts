@@ -79,11 +79,12 @@
  *          sizes, ~160B to ~12KB serialized). The
  *          runner merges the per-iteration summaries (exact best/avg/count and
  *          histograms; percentile-of-percentiles for p50-p99 — see
- *          mergeRttSummaries). Only the two per-variant pooled rows land in
- *          the PR comment's main table; the per-bucket rows are flagged
- *          `detail` and render as a one-line-per-bucket sparkline matrix in a
- *          collapsed drill-down section instead. No targets yet: targets come
- *          from provider-cadence measurement, separately.
+ *          mergeRttSummaries). Only the two per-variant pooled rows render in
+ *          the PR comment (main table + a collapsed sparkline drill-down with
+ *          the profile lines); the per-index rows are flagged `detail` and
+ *          live in the results JSON only — measured flat across runs, they
+ *          are kept as investigation data, not rendered rows. No targets yet:
+ *          targets come from provider-cadence measurement, separately.
  *
  * Scenarios (defined in workbench/example/workflows/97_bench.ts):
  *
@@ -707,10 +708,11 @@ function recordMetric(
  * count/best/avg/histogram, percentile-of-percentiles for p50-p99. `samples`
  * is the total chunk count across iterations. The merged fixed-bin histogram
  * rides along for the PR comment's sparkline drill-down (exact vs `main`,
- * where the percentiles are approximations). Rows with `detail` stay out of
- * the main results table and only appear in that drill-down — one variant
- * gets one headline row, not one row per bucket. No targets yet (see the
- * CRTT header note), so no 🔴 marks render.
+ * where the percentiles are approximations). Rows with `detail` are not
+ * rendered at all — they carry the per-index-bucket splits in the results
+ * JSON (with baseline annotations) so a headline regression can be localized
+ * from the artifacts. No targets yet (see the CRTT header note), so no 🔴
+ * marks render.
  */
 function recordCrttMetric(
   scenario: string,
@@ -992,9 +994,9 @@ describe('workflow benchmarks', () => {
       () => runCrttIteration('llm')
     );
     // The pooled row is the headline (per-chunk RTT averaged independent of
-    // chunk size) and the only llm row in the main table; the index-bucket
-    // rows split it by position in the stream and render as sparkline lines
-    // in the collapsed drill-down.
+    // chunk size) and the only rendered llm row; the index-bucket rows split
+    // it by position in the stream for the results artifacts (flat across
+    // runs so far, so they are data for investigations, not rendered rows).
     recordCrttMetric(
       SCENARIO_CHUNK_RTT_LLM,
       results.map((r) => r.crtt.all),

@@ -562,22 +562,25 @@ test('renders the CRTT drill-down as a sparkline matrix', async () => {
   assert.match(body, /\| \*\*CRTT\*\* \| chunk RTT \(size sweep\) \|/);
   assert.doesNotMatch(body, /\| \*\*CRTT\*\* \| chunk RTT llm \(seq 0\) \|/);
 
-  // Collapsed drill-down: one line per bucket with sparkline + stats.
+  // Collapsed drill-down: one line per VARIANT with sparkline + stats.
+  // Detail (per-index) rows are data-only: present in the JSON, never
+  // rendered.
   assert.match(
     body,
-    /<details>\n<summary>📈 CRTT drill-down vs main \(per-bucket RTT distributions\)<\/summary>/
+    /<details>\n<summary>📈 CRTT drill-down vs main \(RTT distributions & profiles\)<\/summary>/
   );
-  assert.match(body, /bucket +RTT 1ms→5s\+ +avg +p50 +p90 +p99 +n/);
+  assert.match(body, /variant +RTT 1ms→5s\+ +avg +p50 +p90 +p99 +n/);
   // Sparkline over the fixed log bins: the dominant bin renders as █, with
   // · keeping empty bins (the axis) visible.
-  assert.match(body, /llm all +·+[▁▂▃▄▅▆▇█]*█/);
-  assert.match(body, /llm seq 0 /);
-  assert.match(body, /sweep all /);
+  assert.match(body, /llm +·+[▁▂▃▄▅▆▇█]*█/);
+  assert.match(body, /sweep +·+[▁▂▃▄▅▆▇█]*█/);
+  // Neither as a matrix line nor as a table row (the only "seq 0" left in
+  // the comment is the footer note explaining the artifact-only rows).
+  assert.doesNotMatch(body, /llm seq 0/);
+  assert.doesNotMatch(body, /chunk RTT llm \(seq 0\)/);
   // Exact avg delta vs main; percentiles equal → ±0%.
   assert.match(body, /120 \(-20%\)/);
   assert.match(body, /128 \(±0%\)/);
-  // seq 0's avg matches its baseline → ±0%, not -20%.
-  assert.match(body, /llm seq 0 +.*130 \(±0%\)/);
   // No per-bucket bar charts anymore — the matrix is the whole section.
   assert.doesNotMatch(body, /Avg RTT:/);
   assert.doesNotMatch(body, /chunks \d/);
@@ -601,6 +604,11 @@ test('renders the CRTT drill-down as a sparkline matrix', async () => {
     rows.find((r) => r.group === 'sweep').sizeAvgMs,
     undefined
   );
+  // The detail row itself IS embedded (with its baseline annotations) — it
+  // is investigation data, just not rendered.
+  const detailRow = rows.find((r) => r.detail);
+  assert.strictEqual(detailRow.bucket, 'seq 0');
+  assert.strictEqual(detailRow.baselineAvg, 130);
   // Re-rendering from history keeps the table but drops the drill-down.
   const rerendered = renderComment({
     status: 'running',
@@ -624,12 +632,12 @@ test('shows the CRTT drill-down without deltas when main has no CRTT', async () 
 
   assert.match(
     body,
-    /<summary>📈 CRTT drill-down \(per-bucket RTT distributions\)<\/summary>/
+    /<summary>📈 CRTT drill-down \(RTT distributions & profiles\)<\/summary>/
   );
   assert.doesNotMatch(body, /CRTT drill-down vs main/);
   assert.match(body, /No `main` baseline yet/);
   // Stats render without percentage suffixes.
-  assert.match(body, /llm all +·+█·+ +120 +128 +438 +1229 +3000/);
+  assert.match(body, /llm +·+█·+ +120 +128 +438 +1229 +3000/);
   assert.doesNotMatch(body, /%\)/);
 });
 
