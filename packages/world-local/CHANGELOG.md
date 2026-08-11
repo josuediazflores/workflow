@@ -1,5 +1,19 @@
 # @workflow/world-local
 
+## 5.0.0-beta.35
+
+### Patch Changes
+
+- [#3382](https://github.com/vercel/workflow/pull/3382) [`a8db185`](https://github.com/vercel/workflow/commit/a8db185c3b19b3dab971f51aa076aead81ed26ea) Thanks [@VaguelySerious](https://github.com/VaguelySerious)! - Fold new events returned by `events.create` into the replay log so a completed wait no longer needs a follow-up `events.list` round trip
+
+- [#3205](https://github.com/vercel/workflow/pull/3205) [`22349e9`](https://github.com/vercel/workflow/commit/22349e95fd85a112cbec3f425900b74bf5ccc77f) Thanks [@NathanColosimo](https://github.com/NathanColosimo)! - Load replay-event suffixes through one World request.
+
+- [#3124](https://github.com/vercel/workflow/pull/3124) [`65139ac`](https://github.com/vercel/workflow/commit/65139acfd7118d3b73672435a6e1c47115f6e23f) Thanks [@NathanColosimo](https://github.com/NathanColosimo)! - Infer required run and step entities, including their start times, from
+  `events.create` request types.
+- Updated dependencies [[`74dbf81`](https://github.com/vercel/workflow/commit/74dbf81d327b8574cca429b56757c7322a26b4ef), [`a8db185`](https://github.com/vercel/workflow/commit/a8db185c3b19b3dab971f51aa076aead81ed26ea), [`439a495`](https://github.com/vercel/workflow/commit/439a495a715b9426ef4dbcf8d928a8fc50ffb040), [`22349e9`](https://github.com/vercel/workflow/commit/22349e95fd85a112cbec3f425900b74bf5ccc77f), [`65139ac`](https://github.com/vercel/workflow/commit/65139acfd7118d3b73672435a6e1c47115f6e23f)]:
+  - @workflow/world@5.0.0-beta.26
+  - @workflow/errors@5.0.0-beta.16
+
 ## 5.0.0-beta.34
 
 ### Major Changes
