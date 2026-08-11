@@ -38,9 +38,13 @@ dependencies = [
 # released vercel-queue predates #266, so a `vercel`-only bump raises at import.
 #
 # Regenerate the lock with `uv lock --no-config`. A global `exclude-newer` in
-# `~/.config/uv/uv.toml` is otherwise recorded in `uv.lock`, and CI and the
-# Vercel builder — which have no such config — then reject the lock under
-# `--locked`.
+# `~/.config/uv/uv.toml` is otherwise recorded in `uv.lock` as an `[options]`
+# block, and CI and the Vercel builder — which have no such config — then
+# reject the lock under `--locked`.
+#
+# `uv run` re-locks too, so merely starting the app used to undo that: the
+# `dev` script passes `--no-config` for the same reason. Anything else here
+# that shells out to uv needs it as well.
 [tool.uv.sources]
 vercel = { git = "https://github.com/vercel/vercel-py", rev = "f9a16006aaa62c94e86b70e9c2b878b0d8d87f24", subdirectory = "src/vercel" }
 vercel-queue = { git = "https://github.com/vercel/vercel-py", rev = "f9a16006aaa62c94e86b70e9c2b878b0d8d87f24", subdirectory = "src/vercel-queue" }

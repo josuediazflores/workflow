@@ -20,7 +20,10 @@ WORKFLOW_PUBLIC_MANIFEST=1 pnpm dev     # uvicorn on :3000
 
 `--locked` because a plain `uv sync` will quietly rewrite `uv.lock` if your
 personal `~/.config/uv/uv.toml` sets anything that affects resolution — see the
-note above `[tool.uv.sources]` in `pyproject.toml`.
+note above `[tool.uv.sources]` in `pyproject.toml`. `pnpm dev` is safe for the
+same reason: it passes `--no-config` to `uv run`, which would otherwise re-lock
+on startup. If you find an `[options]` block at the top of `uv.lock`, something
+ran uv without one of those two guards, and CI will reject the lock.
 
 Then, from the repo root:
 
