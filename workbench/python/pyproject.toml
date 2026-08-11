@@ -26,7 +26,11 @@ dependencies = [
 # included — resolving from PyPI. Naming `vercel-queue` here (and in
 # `dependencies` above) makes uv resolve the whole vercel-py workspace out of
 # the checkout instead, so all nine packages come from this one rev. Read
-# `uv.lock` after a bump and check the `source` lines are `git`.
+# `uv.lock` after a bump and check the `source` lines are `git` — there should
+# be eight. Bumping the rev and re-running `uv lock` in place is not enough: uv
+# takes the old lock as preferences, and the seven siblings it is not told about
+# directly fall back to PyPI at the same version numbers, quietly. Delete
+# `uv.lock` and relock from scratch instead.
 #
 # It matters because the Vercel world's CBOR queue transport spans two packages:
 # `vercel` attaches the codec to a `Topic` / `TopicPattern` (vercel-py#265), and
@@ -38,8 +42,8 @@ dependencies = [
 # Vercel builder — which have no such config — then reject the lock under
 # `--locked`.
 [tool.uv.sources]
-vercel = { git = "https://github.com/vercel/vercel-py", rev = "36d5763a62cf81f23425187f06c4001d048d4f53", subdirectory = "src/vercel" }
-vercel-queue = { git = "https://github.com/vercel/vercel-py", rev = "36d5763a62cf81f23425187f06c4001d048d4f53", subdirectory = "src/vercel-queue" }
+vercel = { git = "https://github.com/vercel/vercel-py", rev = "f9a16006aaa62c94e86b70e9c2b878b0d8d87f24", subdirectory = "src/vercel" }
+vercel-queue = { git = "https://github.com/vercel/vercel-py", rev = "f9a16006aaa62c94e86b70e9c2b878b0d8d87f24", subdirectory = "src/vercel-queue" }
 
 # How `@vercel/python` builds this app. Reached only because `vercel.json`
 # declares `pyproject.toml` as the build src, which puts the builder in

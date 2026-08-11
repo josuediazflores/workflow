@@ -111,13 +111,13 @@ runs are created. Before that, every write failed with `v4 createEvent: response
 missing required x-wf-* headers` and a `SyntaxError: Unexpected token '<'` — the
 HTML SSO page, not a workflow-server response.
 
-The *app* clears it with a header, and vercel-py does not send that header. This
-is what currently fails the lane. `getHttpConfig`
-(`packages/world-vercel/src/utils.ts:366`) sets both `Authorization: Bearer
-<oidc>` **and** `x-vercel-trusted-oidc-idp-token: <oidc>`; vercel-py's
-`_cbor_request` (`_internal/workflow/worlds/vercel.py:191`) sets only the first.
-Trusted Sources reads the second, so the very first call the workflow handler
-makes — `runs_get`, before any replay — comes back `302` to the SSO page:
+The *app* clears it with a header, and until `f9a16006` vercel-py did not send
+that header. `getHttpConfig` (`packages/world-vercel/src/utils.ts:366`) sets
+both `Authorization: Bearer <oidc>` **and**
+`x-vercel-trusted-oidc-idp-token: <oidc>`; vercel-py's `_cbor_request` set only
+the first. Trusted Sources reads the second, so the very first call the workflow
+handler made — `runs_get`, before any replay — came back `302` to the SSO page,
+and every delivery 500'd:
 
 ```
 HTTP Request: GET https://e2e.vercel-workflow.com/api/v2/runs/wrun_... "HTTP/1.1 302 Found"
@@ -127,9 +127,11 @@ json.decoder.JSONDecodeError: Expecting value: line 1 column 1 (char 0)
 cbor2.CBORDecodeEOF: premature end of stream
 ```
 
-`_cbor_request` also parses the body before checking the status, which is why a
-redirect surfaces as a CBOR decode error rather than as "you were redirected to
-a login page". Both need fixing upstream.
+That the redirect surfaced as a CBOR decode error rather than as "you were
+redirected to a login page" was a second bug in the same function: it parsed the
+body before checking the status. Both are fixed in the pinned rev — the auth
+headers now split proxy from direct the way `getHttpConfig` does, and a non-2xx
+derives its error from the status before the body is touched.
 
 Production runs are unaffected on both counts: the secret is `''` on `main`, so
 each side talks to `vercel-workflow.com`, which is not protected.
